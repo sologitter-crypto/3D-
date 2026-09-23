@@ -1,0 +1,3777 @@
+# coding: utf-8
+"""
+斬鉄 3D ― Pythonista 3 (iOS) 用 3D 剣戟ゲーム
+
+  物理 : 純 Python の 3D Verlet ラグドール
+         体節質量 / 関節可動域 / 能動姿勢制御 / 部位の切断(3 太刀で断つ)
+  描画 : SceneKit(objc_util)。人体は断面輪郭から生成した独自メッシュ。
+         物理の結果をノードへ書き込むだけで、構造体の読み出しは使わない
+  操作 : 左ドラッグ = 移動 / 右ドラッグ = 剣先 / 右タップ = 突き / 跳 = ジャンプ
+         (移動と剣は同時に操作できる)
+"""
+import math
+import random
+import time
+import ctypes
+import struct
+
+import ui
+import objc_util
+from objc_util import (ObjCClass, ObjCInstance, ns, load_framework,
+                       CGRect, CGPoint, CGSize)
+
+load_framework('SceneKit')
+
+# =====================================================================
+# 設定
+# =====================================================================
+QUALITY = 2            # 2: HDR/ブルーム/SSAO あり  1: 軽量  0: 最軽量
+CPU_LEVEL = 1.0        # 0.6 = 易しい / 1.0 = 普通 / 1.4 = 手強い
+BLOOD = True           # False で血の表現(飛沫・血痕・断面の色)を無くす
+WOUNDS_TO_SEVER = 3    # 同じ部位へ何太刀で断つか
+WIN_ROUNDS = 2         # 何本先取で景(ステージ)を制覇するか
+PAD_X0 = 0.42          # 画面のこの位置より右が剣の操作面。右側だけで全域を振れる
+
+# =====================================================================
+# ベクトル
+# =====================================================================
+UP = (0.0, 1.0, 0.0)
+
+
+def add(a, b):
+    return (a[0] + b[0], a[1] + b[1], a[2] + b[2])
+
+
+def sub(a, b):
+    return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
+
+
+def mul(a, s):
+    return (a[0] * s, a[1] * s, a[2] * s)
+
+
+def dot(a, b):
+    return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
+
+
+def cross(a, b):
+    return (a[1] * b[2] - a[2] * b[1],
+            a[2] * b[0] - a[0] * b[2],
+            a[0] * b[1] - a[1] * b[0])
+
+
+def length(a):
+    return math.sqrt(a[0] * a[0] + a[1] * a[1] + a[2] * a[2])
+
+
+def norm(a):
+    l = length(a)
+    if l < 1e-9:
+        return (0.0, 0.0, 0.0)
+    return (a[0] / l, a[1] / l, a[2] / l)
+
+
+def lerp(a, b, t):
+    return (a[0] + (b[0] - a[0]) * t,
+            a[1] + (b[1] - a[1]) * t,
+            a[2] + (b[2] - a[2]) * t)
+
+
+def clamp(v, lo, hi):
+    return lo if v < lo else (hi if v > hi else v)
+
+
+def quat_from_basis(X, Y, Z):
+    """列ベクトル (X, Y, Z) の回転行列 → 四元数 (x, y, z, w)"""
+    m00, m01, m02 = X[0], Y[0], Z[0]
+    m10, m11, m12 = X[1], Y[1], Z[1]
+    m20, m21, m22 = X[2], Y[2], Z[2]
+    tr = m00 + m11 + m22
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        return ((m21 - m12) / s, (m02 - m20) / s, (m10 - m01) / s, 0.25 * s)
+    if m00 > m11 and m00 > m22:
+        s = math.sqrt(1.0 + m00 - m11 - m22) * 2.0
+        return (0.25 * s, (m01 + m10) / s, (m02 + m20) / s, (m21 - m12) / s)
+    if m11 > m22:
+        s = math.sqrt(1.0 + m11 - m00 - m22) * 2.0
+        return ((m01 + m10) / s, 0.25 * s, (m12 + m21) / s, (m02 - m20) / s)
+    s = math.sqrt(1.0 + m22 - m00 - m11) * 2.0
+    return ((m02 + m20) / s, (m12 + m21) / s, 0.25 * s, (m10 - m01) / s)
+
+
+def basis_y(d):
+    """ローカル Y 軸を d に向ける正規直交基底 (X, Y, Z)"""
+    ref = (0.0, 0.0, 1.0) if abs(d[1]) > 0.9 else (0.0, 1.0, 0.0)
+    X = norm(cross(d, ref))
+    Z = cross(X, d)
+    return X, d, Z
+
+
+def frame_from(Y, zref):
+    """Y を軸に、Z を zref へできるだけ合わせた右手系 (X, Y, Z)。X = Y×Z"""
+    Z = sub(zref, mul(Y, dot(zref, Y)))
+    if length(Z) < 1e-4:
+        return basis_y(Y)
+    Z = norm(Z)
+    return cross(Y, Z), Y, Z
+
+
+def seg_seg(p1, q1, p2, q2):
+    """線分同士の最近点。(s, t, c1, c2)"""
+    d1 = sub(q1, p1)
+    d2 = sub(q2, p2)
+    r = sub(p1, p2)
+    a = dot(d1, d1)
+    e = dot(d2, d2)
+    f = dot(d2, r)
+    eps = 1e-10
+    if a <= eps and e <= eps:
+        return 0.0, 0.0, p1, p2
+    if a <= eps:
+        s = 0.0
+        t = clamp(f / e, 0.0, 1.0)
+    else:
+        c = dot(d1, r)
+        if e <= eps:
+            t = 0.0
+            s = clamp(-c / a, 0.0, 1.0)
+        else:
+            b = dot(d1, d2)
+            den = a * e - b * b
+            s = clamp((b * f - c * e) / den, 0.0, 1.0) if den > eps else 0.0
+            t = (b * s + f) / e
+            if t < 0.0:
+                t = 0.0
+                s = clamp(-c / a, 0.0, 1.0)
+            elif t > 1.0:
+                t = 1.0
+                s = clamp((b - c) / a, 0.0, 1.0)
+    return s, t, add(p1, mul(d1, s)), add(p2, mul(d2, t))
+
+
+# =====================================================================
+# 物理パラメータ(SI 単位:m, kg, s)
+# =====================================================================
+DT = 1.0 / 60.0
+SUB = 2
+SDT = DT / SUB
+ITER = 4
+GRAV = -9.81
+DAMP = 0.999
+GROUND_FRIC = 0.78
+ARENA_R = 5.0
+
+(PELVIS, CHEST, NECK, HEAD,
+ SHO_L, ELB_L, HAND_L, SHO_R, ELB_R, HAND_R,
+ HIP_L, KNEE_L, ANK_L, TOE_L, HIP_R, KNEE_R, ANK_R, TOE_R,
+ GRIP, TIP) = range(20)
+NBASE = 20
+
+MASS = {PELVIS: 11.0, CHEST: 20.0, NECK: 2.0, HEAD: 5.0,
+        SHO_L: 2.0, ELB_L: 1.8, HAND_L: 0.7,
+        SHO_R: 2.0, ELB_R: 1.8, HAND_R: 0.7,
+        HIP_L: 2.5, KNEE_L: 4.5, ANK_L: 1.6, TOE_L: 0.5,
+        HIP_R: 2.5, KNEE_R: 4.5, ANK_R: 1.6, TOE_R: 0.5,
+        GRIP: 0.55, TIP: 0.45}
+RAD = {PELVIS: 0.10, CHEST: 0.12, NECK: 0.05, HEAD: 0.105,
+       SHO_L: 0.06, ELB_L: 0.05, HAND_L: 0.045,
+       SHO_R: 0.06, ELB_R: 0.05, HAND_R: 0.045,
+       HIP_L: 0.08, KNEE_L: 0.07, ANK_L: 0.05, TOE_L: 0.03,
+       HIP_R: 0.08, KNEE_R: 0.07, ANK_R: 0.05, TOE_R: 0.03,
+       GRIP: 0.02, TIP: 0.012}
+
+L_THIGH, L_SHIN = 0.45, 0.44
+L_UARM, L_FARM = 0.30, 0.28
+BLADE = 0.85
+REACH = L_UARM + L_FARM + BLADE - 0.03
+STAND_H = 0.97
+UP_STAND = 0.67
+DOWN_TH = 0.36
+
+SPEED = 1.5
+SERVO = 26.0
+JUMP_V = 3.0
+ARM_V = 16.0
+DOWN_F = 45
+GETUP_F = 60
+# 歩行(足を交互に踏み替える。接地中の足は滑らない)
+STEP_T = 0.22          # 1 歩の所要時間 [s]
+STEP_LIFT = 0.09       # 足を上げる高さ [m]
+STEP_TRIG = 0.05       # 足の目標とのずれがこれを超えたら踏み出す [m]
+STEP_REACH = 0.26      # 腰から接地足がこれ以上離れたら急いで踏み出す [m]
+WALK_CROUCH = 0.05     # 歩くときに膝を曲げて腰を落とす量 [m]
+
+# 斬撃の判定(刃と部位の相対速度のうち、部位の軸と刃の両方に垂直な成分 [m/s])
+HIT_V = 2.2                      # これ以上で浅手
+HEAD_V = 4.5                     # 頭への深手
+TORSO_V = 6.0                    # 胴への深手
+WOUND_V = {'farm': 3.6, 'uarm': 4.2, 'shin': 4.2, 'thigh': 4.8, 'neck': 4.2}
+MAX_HP = 100.0
+
+PART_JP = {'farm_l': '左前腕', 'farm_r': '右前腕',
+           'uarm_l': '左上腕', 'uarm_r': '右上腕',
+           'thigh_l': '左腿', 'thigh_r': '右腿',
+           'shin_l': '左脛', 'shin_r': '右脛',
+           'neck': '首', 'head': '頭', 'torso': '胴',
+           'foot_l': '左足', 'foot_r': '右足'}
+
+# (i, j, 当たり半径, 材質, 部位, 切断可, 形状)   材質 None は判定のみ
+SEG_DEFS = [
+    (PELVIS, CHEST, 0.150, 'hakama', 'torso', False, 'torso_l'),
+    (CHEST, NECK, 0.160, 'kimono', 'torso', False, 'torso_u'),
+    (SHO_L, SHO_R, 0.075, None, 'torso', False, None),
+    (NECK, HEAD, 0.058, 'skin', 'neck', True, 'neck'),
+    (HEAD, HEAD, 0.105, None, 'head', False, None),
+    (SHO_L, ELB_L, 0.066, 'sleeve', 'uarm_l', True, 'uarm'),
+    (ELB_L, HAND_L, 0.043, 'skin', 'farm_l', True, 'farm'),
+    (SHO_R, ELB_R, 0.066, 'sleeve', 'uarm_r', True, 'uarm'),
+    (ELB_R, HAND_R, 0.043, 'skin', 'farm_r', True, 'farm'),
+    (HIP_L, KNEE_L, 0.100, 'hakama', 'thigh_l', True, 'thigh'),
+    (KNEE_L, ANK_L, 0.100, 'hakama', 'shin_l', True, 'shin'),
+    (HIP_R, KNEE_R, 0.100, 'hakama', 'thigh_r', True, 'thigh'),
+    (KNEE_R, ANK_R, 0.100, 'hakama', 'shin_r', True, 'shin'),
+    (ANK_L, TOE_L, 0.042, 'tabi', 'foot_l', False, 'foot'),
+    (ANK_R, TOE_R, 0.042, 'tabi', 'foot_r', False, 'foot'),
+]
+
+PAL_P = {'name': 'p', 'kimono': (0.10, 0.15, 0.30), 'sleeve': (0.12, 0.18, 0.35),
+         'hakama': (0.08, 0.09, 0.13), 'obi': (0.80, 0.78, 0.72),
+         'band': (0.92, 0.93, 0.96), 'hud': (0.45, 0.62, 0.95)}
+PAL_C = {'name': 'c', 'kimono': (0.30, 0.05, 0.06), 'sleeve': (0.36, 0.07, 0.08),
+         'hakama': (0.10, 0.08, 0.08), 'obi': (0.70, 0.55, 0.22),
+         'band': (0.80, 0.12, 0.12), 'hud': (0.92, 0.36, 0.32)}
+PAL_NINJA = {'name': 'n', 'kimono': (0.06, 0.06, 0.07), 'sleeve': (0.08, 0.08, 0.09),
+             'hakama': (0.05, 0.05, 0.06), 'obi': (0.30, 0.06, 0.06),
+             'band': (0.35, 0.05, 0.05), 'hud': (0.80, 0.40, 0.90)}
+PAL_RONIN = {'name': 'r', 'kimono': (0.55, 0.53, 0.50), 'sleeve': (0.60, 0.58, 0.55),
+             'hakama': (0.25, 0.20, 0.16), 'obi': (0.15, 0.13, 0.12),
+             'band': (0.20, 0.30, 0.55), 'hud': (0.95, 0.80, 0.40)}
+PAL_ARMOR = {'name': 'a', 'kimono': (0.45, 0.03, 0.03), 'sleeve': (0.12, 0.10, 0.10),
+             'hakama': (0.06, 0.05, 0.05), 'obi': (0.85, 0.68, 0.25),
+             'band': (0.85, 0.68, 0.25), 'hud': (1.00, 0.45, 0.20)}
+
+# ステージ(景)
+STAGES = [
+    {'key': 'temple', 'name': '夕暮れの寺', 'desc': '桜散る枯山水', 'level': 0.75,
+     'sky': ((0.13, 0.11, 0.28), (0.62, 0.36, 0.46), (0.99, 0.66, 0.44), (0.42, 0.30, 0.34)),
+     'cloud': (1.0, 0.86, 0.80), 'fog': (0.86, 0.60, 0.52), 'fog_d': (22.0, 190.0),
+     'sun': ((1.0, 0.80, 0.62), 1250.0, (-0.62, -0.42, 0.66)),
+     'fill': ((0.55, 0.62, 0.95), 420.0), 'amb': ((0.42, 0.36, 0.50), 380.0),
+     'disc': 'sun', 'mtn': (0.30, 0.24, 0.36), 'ground': 'gravel',
+     'scenery': 'temple', 'particles': 'petal', 'pal': PAL_C},
+    {'key': 'bamboo', 'name': '月下の竹林', 'desc': '蛍の舞う夜', 'level': 1.0,
+     'sky': ((0.02, 0.03, 0.07), (0.05, 0.09, 0.17), (0.17, 0.25, 0.32), (0.04, 0.06, 0.07)),
+     'cloud': (0.55, 0.62, 0.75), 'fog': (0.09, 0.14, 0.18), 'fog_d': (8.0, 60.0),
+     'sun': ((0.62, 0.72, 1.0), 900.0, (0.45, -0.62, -0.5)),
+     'fill': ((0.30, 0.50, 0.40), 260.0), 'amb': ((0.16, 0.20, 0.30), 360.0),
+     'disc': 'moon', 'mtn': (0.05, 0.07, 0.10), 'ground': 'moss',
+     'scenery': 'bamboo', 'particles': 'firefly', 'pal': PAL_NINJA},
+    {'key': 'snow', 'name': '雪の城下', 'desc': 'しんしんと降る雪', 'level': 1.2,
+     'sky': ((0.42, 0.47, 0.58), (0.66, 0.70, 0.78), (0.86, 0.88, 0.92), (0.70, 0.72, 0.78)),
+     'cloud': (0.95, 0.96, 0.98), 'fog': (0.80, 0.83, 0.88), 'fog_d': (10.0, 80.0),
+     'sun': ((0.95, 0.96, 1.0), 950.0, (-0.3, -0.72, 0.42)),
+     'fill': ((0.70, 0.78, 0.95), 420.0), 'amb': ((0.60, 0.64, 0.72), 520.0),
+     'disc': None, 'mtn': (0.62, 0.66, 0.74), 'ground': 'snow',
+     'scenery': 'castle', 'particles': 'snow', 'pal': PAL_RONIN},
+    {'key': 'fire', 'name': '炎上の天守', 'desc': '最後の一騎打ち', 'level': 1.45,
+     'sky': ((0.04, 0.02, 0.03), (0.22, 0.05, 0.04), (0.85, 0.32, 0.10), (0.18, 0.07, 0.05)),
+     'cloud': (0.30, 0.18, 0.15), 'fog': (0.40, 0.14, 0.07), 'fog_d': (12.0, 90.0),
+     'sun': ((1.0, 0.55, 0.25), 900.0, (0.5, -0.35, 0.6)),
+     'fill': ((0.45, 0.35, 0.60), 260.0), 'amb': ((0.35, 0.18, 0.14), 380.0),
+     'disc': None, 'mtn': (0.12, 0.05, 0.05), 'ground': 'stone',
+     'scenery': 'fire', 'particles': 'ember', 'pal': PAL_ARMOR},
+]
+
+# =====================================================================
+# 人体の形(断面輪郭)
+#   (u, rx, rz, cx, cz)  u: 骨の始点 0 → 終点 1(範囲外で骨の先へ延長)
+#   ローカル座標 X = 右, Y = 骨方向, Z = 背側(-Z が体の前面)
+# =====================================================================
+PROFILES = {
+    # 骨盤〜腹(袴の上端)
+    'torso_l': [(-0.40, .118, .092, 0, .004), (-0.15, .162, .112, 0, .016),
+                (0.10, .166, .108, 0, .010), (0.40, .146, .097, 0, .0),
+                (0.75, .150, .100, 0, -.004), (1.05, .158, .104, 0, -.008)],
+    # 胸郭〜肩(着物)。胸は前へ、肩は横へ張る
+    'torso_u': [(-0.90, .147, .097, 0, 0), (-0.40, .160, .106, 0, -.005),
+                (0.00, .176, .115, 0, -.012), (0.45, .190, .110, 0, -.008),
+                (0.72, .203, .094, 0, .0), (0.92, .150, .080, 0, .006),
+                (1.08, .072, .062, 0, .008)],
+    'obi': [(0.28, .156, .106, 0, .001), (0.40, .153, .104, 0, 0),
+            (0.62, .151, .103, 0, -.002)],
+    'collar': [(0.90, .158, .086, 0, .004), (1.00, .110, .072, 0, .007),
+               (1.08, .080, .066, 0, .008)],
+    'neck': [(-0.25, .058, .056, 0, .004), (0.35, .050, .050, 0, .006),
+             (0.80, .049, .048, 0, .004)],
+    # 上腕(袖)。三角筋の張り
+    'uarm': [(-0.16, .070, .066, 0, 0), (0.12, .068, .064, 0, 0),
+             (0.55, .061, .058, 0, 0), (0.95, .056, .053, 0, 0),
+             (1.05, .053, .050, 0, 0)],
+    # 前腕。肘下の腕橈骨筋の膨らみ → 手首へ細る
+    'farm': [(-0.06, .043, .041, 0, 0), (0.22, .047, .042, 0, -.003),
+             (0.60, .037, .031, 0, 0), (0.93, .029, .023, 0, 0),
+             (1.02, .028, .022, 0, 0)],
+    # 大腿(袴)
+    'thigh': [(-0.12, .106, .100, 0, .005), (0.30, .099, .095, 0, .004),
+              (0.70, .093, .090, 0, 0), (1.04, .089, .086, 0, 0)],
+    # 下腿(袴の裾が広がる)
+    'shin': [(-0.04, .089, .087, 0, 0), (0.40, .099, .097, 0, .004),
+             (0.80, .116, .110, 0, .006), (0.96, .126, .118, 0, .006)],
+    # 足(足袋)。Z が下(足裏)
+    'foot': [(-0.45, .032, .034, 0, .017), (-0.05, .038, .044, 0, .012),
+             (0.45, .044, .030, 0, .014), (0.95, .042, .020, 0, .012),
+             (1.10, .030, .016, 0, .012)],
+    # 握り拳(手首 → 拳)。L0 = 0.10、原点が拳の中心
+    'hand': [(-0.15, .027, .021, 0, 0), (0.20, .042, .027, 0, 0),
+             (0.55, .047, .033, 0, -.004), (0.85, .043, .032, 0, -.004),
+             (1.00, .033, .026, 0, -.002)],
+}
+EXTRAS = {'torso_l': [('obi', 'obi')], 'torso_u': [('collar', 'collar')]}
+
+
+def prof_eval(keys, u):
+    """輪郭をキャットマル-ロム補間 → (rx, rz, cx, cz)"""
+    n = len(keys)
+    if u <= keys[0][0]:
+        return keys[0][1:]
+    if u >= keys[-1][0]:
+        return keys[-1][1:]
+    k = 0
+    while k < n - 2 and u > keys[k + 1][0]:
+        k += 1
+    s = (u - keys[k][0]) / (keys[k + 1][0] - keys[k][0])
+    p0, p1 = keys[max(0, k - 1)], keys[k]
+    p2, p3 = keys[k + 1], keys[min(n - 1, k + 2)]
+    out = []
+    for c in range(1, 5):
+        a, b, cc, d = p0[c], p1[c], p2[c], p3[c]
+        out.append(0.5 * (2 * b + (-a + cc) * s + (2 * a - 5 * b + 4 * cc - d) * s * s
+                          + (-a + 3 * b - 3 * cc + d) * s * s * s))
+    out[0] = max(out[0], 0.004)
+    out[1] = max(out[1], 0.004)
+    return tuple(out)
+
+
+def prof_range(name):
+    k = PROFILES[name]
+    return k[0][0], k[-1][0]
+
+
+def loft(keys, L0, u0, u1, ys, cap0, cap1, M=18, grow=0.0):
+    """断面輪郭から筒状メッシュを作る。
+    cap: 'round' = 丸い端, 'cut' = 切断面(肉と骨), None = 開口
+    戻り値 (頂点, [本体, 肉, 骨] の三角形リスト)"""
+    N = max(4, int((u1 - u0) * L0 / 0.02) + 1)
+    seq = []
+
+    def Y(u):
+        return (u - 0.5) * L0 - ys
+
+    def P(u):
+        rx, rz, cx, cz = prof_eval(keys, u)
+        return rx + grow, rz + grow, cx, cz
+    K = 4
+    r0 = P(u0)
+    if cap0 == 'round':
+        cl = min(r0[0], r0[1]) * 0.9
+        seq.append(('pole', Y(u0) - cl, 0, 0, r0[2], r0[3]))
+        for k in range(1, K):
+            a = (K - k) / float(K) * math.pi * 0.5
+            seq.append(('ring', Y(u0) - math.sin(a) * cl, r0[0] * math.cos(a),
+                        r0[1] * math.cos(a), r0[2], r0[3]))
+    for k in range(N + 1):
+        u = u0 + (u1 - u0) * k / float(N)
+        rx, rz, cx, cz = P(u)
+        seq.append(('ring', Y(u), rx, rz, cx, cz))
+    r1 = P(u1)
+    if cap1 == 'round':
+        cl = min(r1[0], r1[1]) * 0.9
+        for k in range(1, K):
+            a = k / float(K) * math.pi * 0.5
+            seq.append(('ring', Y(u1) + math.sin(a) * cl, r1[0] * math.cos(a),
+                        r1[1] * math.cos(a), r1[2], r1[3]))
+        seq.append(('pole', Y(u1) + cl, 0, 0, r1[2], r1[3]))
+
+    cs = [(math.cos(2 * math.pi * m / M), math.sin(2 * math.pi * m / M))
+          for m in range(M)]
+    verts, main, flesh, bone = [], [], [], []
+    idx = []
+    for e in seq:
+        idx.append(len(verts))
+        if e[0] == 'pole':
+            verts.append((e[4], e[1], e[5]))
+        else:
+            for c, s in cs:
+                verts.append((e[4] + e[2] * c, e[1], e[5] + e[3] * s))
+    for s_ in range(len(seq) - 1):
+        A, B = seq[s_], seq[s_ + 1]
+        ia, ib = idx[s_], idx[s_ + 1]
+        for m in range(M):
+            m1 = (m + 1) % M
+            if A[0] == 'pole':
+                main.append((ia, ib + m, ib + m1))
+            elif B[0] == 'pole':
+                main.append((ia + m, ib, ia + m1))
+            else:
+                main.append((ia + m, ib + m, ib + m1))
+                main.append((ia + m, ib + m1, ia + m1))
+    for end, cap, e in ((0, cap0, seq[0]), (1, cap1, seq[-1])):
+        if cap != 'cut' or e[0] != 'ring':
+            continue
+        y, rx, rz, cx, cz = e[1], e[2], e[3], e[4], e[5]
+        o = len(verts)
+        for sc in (1.0, 0.34, 0.30):
+            for c, s in cs:
+                verts.append((cx + rx * sc * c, y, cz + rz * sc * s))
+        ctr = len(verts)
+        verts.append((cx, y, cz))
+        for m in range(M):
+            m1 = (m + 1) % M
+            O0, O1 = o + m, o + m1
+            I0, I1 = o + M + m, o + M + m1
+            B0, B1 = o + 2 * M + m, o + 2 * M + m1
+            if end == 1:        # 法線 +Y
+                flesh.append((I0, O1, O0))
+                flesh.append((I0, I1, O1))
+                bone.append((ctr, B1, B0))
+            else:               # 法線 -Y
+                flesh.append((I0, O0, O1))
+                flesh.append((I0, O1, I1))
+                bone.append((ctr, B0, B1))
+    return verts, [main, flesh, bone]
+
+
+def vnormals(verts, groups):
+    acc = [[0.0, 0.0, 0.0] for _ in verts]
+    for g in groups:
+        for a, b, c in g:
+            va, vb, vc = verts[a], verts[b], verts[c]
+            n = cross(sub(vb, va), sub(vc, va))
+            for i in (a, b, c):
+                t = acc[i]
+                t[0] += n[0]
+                t[1] += n[1]
+                t[2] += n[2]
+    out = []
+    for t in acc:
+        n = norm(tuple(t))
+        out.append(n if n != (0.0, 0.0, 0.0) else (0.0, 1.0, 0.0))
+    return out
+
+
+# ---------- 頭部(鼻・眉弓・眼窩・頬骨・顎・唇の起伏を持つ変形球) ----------
+HEAD_C = (0.0, 0.012, 0.0)
+_FEAT = []
+
+
+def _feat():
+    if _FEAT:
+        return _FEAT
+    F = []
+    F.append((norm((0, -0.08, -1)), 0.14, 0.021))       # 鼻
+    F.append((norm((0, 0.03, -1)), 0.10, 0.006))        # 鼻根
+    F.append((norm((0, 0.30, -1)), 0.24, 0.006))        # 眉弓
+    for sx in (-1, 1):
+        F.append((norm((0.36 * sx, 0.14, -0.92)), 0.12, -0.010))   # 眼窩
+        F.append((norm((0.56 * sx, -0.12, -0.82)), 0.17, 0.005))   # 頬骨
+        F.append((norm((0.60 * sx, -0.55, -0.58)), 0.20, 0.004))   # 下顎角
+    F.append((norm((0, -0.70, -0.72)), 0.15, 0.008))    # 顎先
+    F.append((norm((0, -0.38, -0.93)), 0.07, 0.0035))   # 上唇
+    F.append((norm((0, -0.48, -0.88)), 0.07, 0.003))    # 下唇
+    F.append((norm((0, -0.43, -0.90)), 0.05, -0.003))   # 口裂
+    _FEAT.extend(F)
+    return F
+
+
+def head_point(d):
+    x, y, z = d
+    px, py, pz = 0.077 * x, 0.106 * y, 0.097 * z
+    if y < -0.15:
+        s = min(1.0, (-y - 0.15) / 0.6)
+        px *= 1.0 - 0.28 * s
+        if z > 0:
+            pz *= 1.0 - 0.32 * s
+    bump = 0.0
+    for c, w, amp in _feat():
+        a2 = 2.0 * (1.0 - dot(d, c))
+        if a2 < 9.0 * w * w:
+            bump += amp * math.exp(-a2 / (2.0 * w * w))
+    return (px + x * bump + HEAD_C[0], py + y * bump + HEAD_C[1],
+            pz + z * bump + HEAD_C[2])
+
+
+def has_hair(d):
+    x, y, z = d
+    return y > (0.10 + 0.32 * (-z) if z < 0 else 0.10 - 0.55 * z)
+
+
+def sphere_mesh(fn, keep=None, LAT=30, LON=44):
+    """単位方向 d → 位置 fn(d) の球面メッシュ。keep(d) で部分だけ残す"""
+    verts, dirs, tris = [], [], []
+    grid = []
+    for i in range(LAT + 1):
+        th = math.pi * i / LAT
+        row = []
+        for j in range(LON):
+            ph = 2 * math.pi * j / LON
+            d = (math.sin(th) * math.cos(ph), math.cos(th), math.sin(th) * math.sin(ph))
+            row.append(len(verts))
+            verts.append(fn(d))
+            dirs.append(d)
+        grid.append(row)
+    for i in range(LAT):
+        for j in range(LON):
+            j1 = (j + 1) % LON
+            a, b, c, e = grid[i][j], grid[i + 1][j], grid[i + 1][j1], grid[i][j1]
+            for t in ((a, e, c), (a, c, b)):
+                if keep is None or all(keep(dirs[v]) for v in t):
+                    tris.append(t)
+    orient_out(verts, tris, lambda p: HEAD_C)
+    if keep is not None:
+        used = sorted(set(v for t in tris for v in t))
+        remap = dict((v, k) for k, v in enumerate(used))
+        verts = [verts[v] for v in used]
+        tris = [(remap[a], remap[b], remap[c]) for a, b, c in tris]
+    return verts, tris
+
+
+def orient_out(verts, tris, center_fn):
+    for k, (a, b, c) in enumerate(tris):
+        va, vb, vc = verts[a], verts[b], verts[c]
+        n = cross(sub(vb, va), sub(vc, va))
+        cen = mul(add(add(va, vb), vc), 1.0 / 3.0)
+        if dot(n, sub(cen, center_fn(cen))) < 0:
+            tris[k] = (a, c, b)
+
+
+def head_mesh():
+    return sphere_mesh(head_point)
+
+
+def hair_mesh():
+    return sphere_mesh(lambda d: add(head_point(d), mul(d, 0.0055)), keep=has_hair)
+
+
+# ---------- 刀身(反りと切先・鎬造りの断面・面ごとの陰影) ----------
+def blade_mesh():
+    L, N, sori = BLADE, 18, 0.018
+
+    def xo(y):
+        return -sori * (y / L) ** 2
+
+    def section(y, k):
+        w = (0.031 - 0.006 * (y / L)) * k
+        t = 0.0072 - 0.0022 * (y / L)
+        x = xo(y)
+        return [(x + 0.5 * w, y, 0.0), (x + 0.08 * w, y, 0.5 * t),
+                (x - 0.5 * w, y, 0.32 * t), (x - 0.5 * w, y, -0.32 * t),
+                (x + 0.08 * w, y, -0.5 * t)]
+    rings = [section(L * 0.93 * k / N, 1.0) for k in range(N + 1)]
+    rings.append(section(L * 0.975, 0.62))
+    tip = (xo(L) - 0.004, L, 0.0)
+    verts, tris = [], []
+
+    def tri(a, b, c):
+        o = len(verts)
+        verts.extend([a, b, c])
+        tris.append((o, o + 1, o + 2))
+    for r in range(len(rings) - 1):
+        A, B = rings[r], rings[r + 1]
+        for m in range(5):
+            m1 = (m + 1) % 5
+            tri(A[m], B[m], B[m1])
+            tri(A[m], B[m1], A[m1])
+    for m in range(5):
+        tri(rings[-1][m], tip, rings[-1][(m + 1) % 5])
+    orient_out(verts, tris, lambda p: (xo(min(p[1], L)), p[1], 0.0))
+    return verts, tris
+
+
+# =====================================================================
+# 質点・制御
+# =====================================================================
+class Pt(object):
+    __slots__ = ('x', 'y', 'z', 'px', 'py', 'pz', 'fx', 'fy', 'fz',
+                 'm', 'im', 'r')
+
+    def __init__(self, pos, m, r):
+        self.x, self.y, self.z = pos
+        self.px, self.py, self.pz = pos
+        self.fx = self.fy = self.fz = 0.0
+        self.m = m
+        self.im = 1.0 / m
+        self.r = r
+
+    def pos(self):
+        return (self.x, self.y, self.z)
+
+    def vel(self, idt):
+        return ((self.x - self.px) * idt, (self.y - self.py) * idt,
+                (self.z - self.pz) * idt)
+
+
+def pull(q, tx, ty, tz, ka, kd, idt, ax=True, ay=True, az=True):
+    m = q.m
+    if ax:
+        q.fx += m * (ka * (tx - q.x) - kd * (q.x - q.px) * idt)
+    if ay:
+        q.fy += m * (ka * (ty - q.y) - kd * (q.y - q.py) * idt)
+    if az:
+        q.fz += m * (ka * (tz - q.z) - kd * (q.z - q.pz) * idt)
+
+
+def pull_rel(q, base, t, ka, kd, idt, react):
+    me = 1.0 / (q.im + base.im)
+    fx = me * (ka * (t[0] - q.x) - kd * ((q.x - q.px) - (base.x - base.px)) * idt)
+    fy = me * (ka * (t[1] - q.y) - kd * ((q.y - q.py) - (base.y - base.py)) * idt)
+    fz = me * (ka * (t[2] - q.z) - kd * ((q.z - q.pz) - (base.z - base.pz)) * idt)
+    q.fx += fx
+    q.fy += fy
+    q.fz += fz
+    base.fx -= fx * react
+    base.fy -= fy * react
+    base.fz -= fz * react
+
+
+def ik(a, b, l1, l2, bend):
+    d = sub(b, a)
+    L = clamp(length(d), 1e-4, l1 + l2 - 1e-4)
+    u = norm(d)
+    x = (l1 * l1 - l2 * l2 + L * L) / (2.0 * L)
+    h = math.sqrt(max(0.0, l1 * l1 - x * x))
+    perp = norm(sub(bend, mul(u, dot(bend, u))))
+    return add(add(a, mul(u, x)), mul(perp, h))
+
+
+class Seg(object):
+    __slots__ = ('i', 'j', 'r', 'mat', 'part', 'sever', 'prof', 'L0', 'u0', 'u1',
+                 'ys', 'cap0', 'cap1', 'dead', 'node', 'key', 'zref', 'frame',
+                 'marks', 'mrk_n')
+
+
+# =====================================================================
+# 剣士
+# =====================================================================
+class Fighter(object):
+    _key = 0
+
+    def __init__(self, name, spawn, facing, pal, is_player):
+        self.name = name
+        self.pal = pal
+        self.is_player = is_player
+        self.F = facing
+        self.build(spawn)
+
+    def build(self, spawn):
+        x0, z0 = spawn
+        F = self.F
+        R = (-F[2], 0.0, F[0])
+
+        def W(r, u, f):
+            return (x0 + R[0] * r + F[0] * f, u, z0 + R[2] * r + F[2] * f)
+
+        P = {}
+        P[PELVIS] = W(0.0, 0.97, 0.0)
+        P[CHEST] = W(0.0, 1.29, 0.0)
+        P[NECK] = W(0.0, 1.49, 0.01)
+        P[HEAD] = W(0.0, 1.64, 0.02)
+        P[SHO_L] = W(-0.19, 1.43, 0.0)
+        P[SHO_R] = W(0.19, 1.43, 0.0)
+        P[HIP_L] = W(-0.10, 0.94, 0.0)
+        P[HIP_R] = W(0.10, 0.94, 0.0)
+        P[ANK_L] = W(-0.12, 0.08, -0.17)
+        P[ANK_R] = W(0.12, 0.08, 0.17)
+        P[TOE_L] = W(-0.12, 0.03, -0.02)
+        P[TOE_R] = W(0.12, 0.03, 0.32)
+        bd = norm((F[0] * 0.75, 0.66, F[2] * 0.75))
+        P[GRIP] = W(0.0, 1.12, 0.40)
+        P[TIP] = add(P[GRIP], mul(bd, BLADE))
+        P[HAND_R] = sub(P[GRIP], mul(bd, 0.035))
+        P[HAND_L] = sub(P[GRIP], mul(bd, 0.13))
+        P[KNEE_L] = ik(P[HIP_L], P[ANK_L], L_THIGH, L_SHIN, F)
+        P[KNEE_R] = ik(P[HIP_R], P[ANK_R], L_THIGH, L_SHIN, F)
+        bend_l = norm(add(add(mul(UP, -1.0), mul(F, -0.3)), mul(R, -0.45)))
+        bend_r = norm(add(add(mul(UP, -1.0), mul(F, -0.3)), mul(R, 0.45)))
+        P[ELB_L] = ik(P[SHO_L], P[HAND_L], L_UARM, L_FARM, bend_l)
+        P[ELB_R] = ik(P[SHO_R], P[HAND_R], L_UARM, L_FARM, bend_r)
+
+        self.pt = [Pt(P[i], MASS[i], RAD[i]) for i in range(NBASE)]
+        self.bones = []
+
+        def B(a, b, k=1.0, tag='struct'):
+            self.bones.append([a, b, length(sub(P[a], P[b])), k, tag])
+
+        for a, b, k in ((PELVIS, CHEST, 1.0), (CHEST, NECK, 1.0),
+                        (NECK, HEAD, 1.0), (CHEST, SHO_L, 1.0),
+                        (CHEST, SHO_R, 1.0), (SHO_L, SHO_R, 1.0),
+                        (NECK, SHO_L, 0.8), (NECK, SHO_R, 0.8),
+                        (PELVIS, HIP_L, 1.0), (PELVIS, HIP_R, 1.0),
+                        (HIP_L, HIP_R, 1.0), (CHEST, HIP_L, 0.6),
+                        (CHEST, HIP_R, 0.6), (SHO_L, HIP_L, 0.5),
+                        (SHO_R, HIP_R, 0.5), (SHO_L, HIP_R, 0.3),
+                        (SHO_R, HIP_L, 0.3)):
+            B(a, b, k)
+        for a, b in ((SHO_L, ELB_L), (ELB_L, HAND_L),
+                     (SHO_R, ELB_R), (ELB_R, HAND_R),
+                     (HIP_L, KNEE_L), (KNEE_L, ANK_L), (ANK_L, TOE_L),
+                     (HIP_R, KNEE_R), (KNEE_R, ANK_R), (ANK_R, TOE_R)):
+            B(a, b)
+        B(GRIP, TIP)
+        # 補助(切断で跨ぐと自動で外れる)。首の張りも補助にして首を断てるようにする
+        B(HEAD, CHEST, 0.5, 'aux')
+        B(HEAD, SHO_L, 0.3, 'aux')
+        B(HEAD, SHO_R, 0.3, 'aux')
+        B(KNEE_L, TOE_L, 0.35, 'aux')
+        B(KNEE_R, TOE_R, 0.35, 'aux')
+        B(PELVIS, ANK_L, 0.30, 'aux')
+        B(PELVIS, ANK_R, 0.30, 'aux')
+        B(HEAD, PELVIS, 0.40, 'aux')
+        B(HAND_R, GRIP, 1.0, 'grip')
+        B(HAND_R, TIP, 0.6, 'grip')
+        B(HAND_L, GRIP, 1.0, 'grip')
+        B(HAND_L, TIP, 0.6, 'grip')
+
+        arm = L_UARM + L_FARM
+        leg = L_THIGH + L_SHIN
+        self.limits = [
+            ('max', SHO_L, HAND_L, arm - 0.005), ('min', SHO_L, HAND_L, 0.14),
+            ('max', SHO_R, HAND_R, arm - 0.005), ('min', SHO_R, HAND_R, 0.14),
+            ('max', HIP_L, ANK_L, leg - 0.005), ('min', HIP_L, ANK_L, 0.28),
+            ('max', HIP_R, ANK_R, leg - 0.005), ('min', HIP_R, ANK_R, 0.28),
+            ('knee', HIP_L, KNEE_L, ANK_L, 0.02),
+            ('knee', HIP_R, KNEE_R, ANK_R, 0.02),
+        ]
+
+        self.segs = []
+        for i, j, r, mat, part, sev, prof in SEG_DEFS:
+            L0 = length(sub(P[i], P[j]))
+            s = self.new_seg(i, j, r, mat, part, sev, prof, L0)
+            self.segs.append(s)
+
+        n = len(self.pt)
+        self.att = [True] * n
+        self.grip_hands = set([HAND_L, HAND_R])
+        self.armed = True
+        self.crippled = False
+        self.lost = set()
+        self.wounds = {}
+        self.head_marks = []
+        self.sword_marks = []
+        self.drips = []                 # [点, 残り秒, 次の滴まで, 大きさ]
+        self.head_z = mul(F, -1.0)
+        # 足の接地位置 [x, z, 振り出し中の状態 or None]
+        self.feet = {ANK_L: [P[ANK_L][0], P[ANK_L][2], None],
+                     ANK_R: [P[ANK_R][0], P[ANK_R][2], None]}
+        self.step_cd = 0.0
+        self.bob = 0.0
+        self.crouch = 0.0
+        self.pins = {}                  # 接地して固定している足 {点: (x, z)}
+        # 膝折れ防止の補助骨(骨盤〜足首)。足を上げる間だけ緩める
+        self.leg_aux = {}
+        for bn in self.bones:
+            if bn[4] == 'aux' and bn[0] == PELVIS and bn[1] in (ANK_L, ANK_R):
+                self.leg_aux[bn[1]] = bn
+        self.hand_z = {HAND_L: mul(F, -1.0), HAND_R: mul(F, -1.0)}
+
+        self.hp = MAX_HP
+        self.hp_ghost = MAX_HP
+        self.bleed = 0.0
+        self.ko = False
+        self.down = 0
+        self.getup = 0
+        self.stun = 0
+        self.parry_t = 0
+        self.hit_cd = {}
+        self.anc_x, self.anc_z = x0, z0
+        self.mvx = self.mvz = 0.0
+        self.T_goal = None
+        self.T = P[TIP]
+        self.thrust_t = 0.0
+        self.edge = R
+        self.foe = None
+
+    def new_seg(self, i, j, r, mat, part, sev, prof, L0,
+                u0=None, u1=None, ys=0.0, cap0='round', cap1='round'):
+        s = Seg()
+        s.i, s.j, s.r, s.mat, s.part, s.sever = i, j, r, mat, part, sev
+        s.prof, s.L0 = prof, L0
+        if prof is not None:
+            a, b = prof_range(prof)
+            s.u0 = a if u0 is None else u0
+            s.u1 = b if u1 is None else u1
+        else:
+            s.u0, s.u1 = 0.0, 1.0
+        s.ys, s.cap0, s.cap1 = ys, cap0, cap1
+        s.dead = False
+        s.node = None
+        s.zref = mul(self.F, -1.0) if prof != 'foot' else (0.0, -1.0, 0.0)
+        s.frame = None
+        s.marks = []
+        s.mrk_n = 0
+        Fighter._key += 1
+        s.key = Fighter._key
+        return s
+
+    # ---------- 状態 ----------
+    def R(self):
+        return (-self.F[2], 0.0, self.F[0])
+
+    def grounded(self):
+        p, a = self.pt, self.att
+        return ((a[ANK_L] and p[ANK_L].y < 0.09) or
+                (a[ANK_R] and p[ANK_R].y < 0.09) or
+                (a[TOE_L] and p[TOE_L].y < 0.06) or
+                (a[TOE_R] and p[TOE_R].y < 0.06))
+
+    def upright(self):
+        return self.pt[HEAD].y - self.pt[PELVIS].y
+
+    def alive(self):
+        return not self.ko and not self.crippled
+
+    def shoulder_center(self):
+        p, a = self.pt, self.att
+        if a[SHO_L] and a[SHO_R]:
+            return ((p[SHO_L].x + p[SHO_R].x) * 0.5,
+                    (p[SHO_L].y + p[SHO_R].y) * 0.5,
+                    (p[SHO_L].z + p[SHO_R].z) * 0.5)
+        c = p[CHEST]
+        return (c.x, c.y + 0.14, c.z)
+
+    def guard_tip(self):
+        c = self.pt[CHEST]
+        F = self.F
+        G = (c.x + F[0] * 0.36, c.y - 0.17, c.z + F[2] * 0.36)
+        bd = norm((F[0] * 0.75, 0.66, F[2] * 0.75))
+        return add(G, mul(bd, BLADE))
+
+    def solve_grip(self, T):
+        S = self.shoulder_center()
+        F = self.F
+        v = sub(T, S)
+        back = dot(v, F)
+        if back < -0.35:
+            v = add(v, mul(F, -0.35 - back))
+        L = length(v)
+        if L > REACH:
+            v = mul(v, REACH / L)
+            L = REACH
+        mn = BLADE + 0.22
+        if L < mn:
+            v = mul(norm(v) if L > 1e-4 else F, mn)
+            L = mn
+        T = add(S, v)
+        g = clamp(L - BLADE, 0.22, 0.56)
+        G = add(S, mul(norm(v), g))
+        return G, T
+
+    def base_of(self, idx):
+        """点 idx を終点とする生きた部位(手なら前腕、頭なら首)"""
+        for s in self.segs:
+            if not s.dead and s.j == idx and s.i != idx and s.prof is not None:
+                return s
+        return None
+
+    # ---------- 描画用の姿勢フレーム ----------
+    def anat_z(self, seg):
+        """解剖学的な背側方向(無ければ None=前フレームから平行移動)"""
+        p, a = self.pt, self.att
+        if not (a[seg.i] and a[seg.j]):
+            return None
+        pr = seg.prof
+        Y = norm(sub(p[seg.j].pos(), p[seg.i].pos()))
+        if pr == 'torso_l':
+            X = norm(sub(p[HIP_R].pos(), p[HIP_L].pos()))
+            return norm(cross(X, Y))
+        if pr in ('torso_u', 'neck'):
+            if a[SHO_L] and a[SHO_R]:
+                X = norm(sub(p[SHO_R].pos(), p[SHO_L].pos()))
+                return norm(cross(X, Y))
+            return None
+        if pr == 'foot':
+            return (0.0, -1.0, 0.0)
+        side = seg.part[-1:]
+        if pr in ('thigh', 'shin'):
+            h, k, an = (HIP_L, KNEE_L, ANK_L) if side == 'l' else (HIP_R, KNEE_R, ANK_R)
+            if a[h] and a[k] and a[an]:
+                kv = sub(p[k].pos(), lerp(p[h].pos(), p[an].pos(), 0.5))
+                if length(kv) > 0.012:
+                    return mul(norm(kv), -1.0)
+                return mul(self.F, -1.0)
+            return None
+        if pr in ('uarm', 'farm'):
+            s_, e, h = (SHO_L, ELB_L, HAND_L) if side == 'l' else (SHO_R, ELB_R, HAND_R)
+            if a[s_] and a[e] and a[h]:
+                ev = sub(p[e].pos(), lerp(p[s_].pos(), p[h].pos(), 0.5))
+                if length(ev) > 0.012:
+                    return norm(ev)
+            return None
+        return None
+
+    def seg_frame(self, seg):
+        a, b = self.pt[seg.i], self.pt[seg.j]
+        Y = norm((b.x - a.x, b.y - a.y, b.z - a.z))
+        if Y == (0.0, 0.0, 0.0):
+            return seg.frame
+        ref = seg.zref
+        want = self.anat_z(seg)
+        if want is not None:
+            ref = norm(lerp(ref, want, 0.5))
+        fr = frame_from(Y, ref)
+        seg.zref = fr[2]
+        seg.frame = fr
+        return fr
+
+    def head_frame(self):
+        s = self.base_of(HEAD)
+        base = self.pt[s.i] if s else self.pt[NECK]
+        hd = self.pt[HEAD]
+        Y = norm(sub(hd.pos(), base.pos()))
+        if Y == (0.0, 0.0, 0.0):
+            Y = UP
+        ref = self.head_z
+        if self.att[HEAD]:
+            ref = norm(lerp(ref, mul(self.F, -1.0), 0.5))
+        fr = frame_from(Y, ref)
+        self.head_z = fr[2]
+        return fr
+
+    def hand_frame(self, h):
+        s = self.base_of(h)
+        base = self.pt[s.i] if s else self.pt[h]
+        Y = norm(sub(self.pt[h].pos(), base.pos()))
+        if Y == (0.0, 0.0, 0.0):
+            Y = UP
+        ref = self.hand_z[h]
+        if s is not None and s.frame is not None:
+            ref = norm(lerp(ref, s.frame[2], 0.5))
+        fr = frame_from(Y, ref)
+        self.hand_z[h] = fr[2]
+        return fr
+
+    # ---------- 入力 ----------
+    def do_jump(self):
+        if (self.grounded() and self.down == 0 and self.getup == 0
+                and self.alive()):
+            for i, q in enumerate(self.pt):
+                if self.att[i]:
+                    q.py -= JUMP_V * SDT
+
+    def do_thrust(self):
+        if self.armed and self.alive() and self.thrust_t <= 0.0:
+            self.thrust_t = 0.36
+
+    def sword_goal(self):
+        if self.thrust_t > 0.0 and self.foe is not None:
+            ph = 0.36 - self.thrust_t
+            c = self.pt[CHEST]
+            F = self.F
+            if ph < 0.09:
+                return (c.x - F[0] * 0.05, c.y + 0.02, c.z - F[2] * 0.05)
+            fc = self.foe.pt[CHEST]
+            return (fc.x + F[0] * 0.35, fc.y + 0.05, fc.z + F[2] * 0.35)
+        return self.T_goal
+
+    # ---------- 制御(サブステップごと) ----------
+    def control(self, foe, dt):
+        self.pins = {}                  # 倒れた・死んだ時は足を地面から離す
+        if not self.alive():
+            return
+        p, att = self.pt, self.att
+        idt = 1.0 / dt
+        pel, ch, hd = p[PELVIS], p[CHEST], p[HEAD]
+
+        if self.down == 0 and self.getup == 0:
+            dx = foe.pt[PELVIS].x - pel.x
+            dz = foe.pt[PELVIS].z - pel.z
+            l = math.hypot(dx, dz)
+            if l > 0.05:
+                fx = self.F[0] + (dx / l - self.F[0]) * 0.06
+                fz = self.F[2] + (dz / l - self.F[2]) * 0.06
+                l2 = math.hypot(fx, fz) or 1.0
+                self.F = (fx / l2, 0.0, fz / l2)
+        if self.down > 0:
+            return
+
+        F = self.F
+        R = (-F[2], 0.0, F[0])
+        gu = self.getup > 0
+        air = not self.grounded()
+        g = 1.9 if gu else (0.25 if air else 1.0)
+        if self.stun > 0:
+            g *= 0.45
+
+        # 立ち位置の目標(アンカー)は入力で積分する
+        if gu:
+            self.anc_x, self.anc_z = pel.x, pel.z
+        else:
+            self.anc_x += self.mvx * SPEED * dt
+            self.anc_z += self.mvz * SPEED * dt
+            r = math.hypot(self.anc_x, self.anc_z)
+            lim = ARENA_R - 0.6
+            if r > lim:
+                self.anc_x *= lim / r
+                self.anc_z *= lim / r
+        cx, cz = self.anc_x, self.anc_z
+        lx, lz = self.mvx * 0.05, self.mvz * 0.05
+        # 剣先の目標が低いほど膝を曲げて腰を落とし、上体を前へ倒す(倒れた相手や脛に届く)
+        goal = self.sword_goal() if self.armed else None
+        self.crouch = clamp((0.95 - goal[1]) * 0.55, 0.0, 0.30) if goal else 0.0
+        lx += F[0] * self.crouch * 0.6
+        lz += F[2] * self.crouch * 0.6
+
+        pull(pel, cx, 0, cz, 300 * g, 26 * g, idt, ay=False)
+        if att[HEAD]:
+            pull(hd, cx + lx, 0, cz + lz, 330 * g, 28 * g, idt, ay=False)
+        pull(ch, cx + lx * 0.5, 0, cz + lz * 0.5, 170 * g, 17 * g, idt, ay=False)
+        for i, s in ((HIP_L, -1.0), (HIP_R, 1.0)):
+            pull(p[i], pel.x + R[0] * 0.10 * s, 0, pel.z + R[2] * 0.10 * s,
+                 90 * g, 9 * g, idt, ay=False)
+        for i, s in ((SHO_L, -1.0), (SHO_R, 1.0)):
+            if att[i]:
+                pull(p[i], ch.x + R[0] * 0.19 * s, 0, ch.z + R[2] * 0.19 * s,
+                     70 * g, 8 * g, idt, ay=False)
+        self.legs(dt, idt, g, gu, air, cx, cz, F, R)
+
+        if gu:
+            pull(hd, 0, STAND_H + UP_STAND, 0, 260, 24, idt, ax=False, az=False)
+            pull(ch, 0, STAND_H + 0.32, 0, 210, 21, idt, ax=False, az=False)
+        if self.crouch > 0.02 and not air and not gu:
+            pull(hd, 0, STAND_H + UP_STAND - self.crouch * 1.6, 0, 60, 8, idt,
+                 ax=False, az=False)
+        if not air or gu:
+            pull(pel, 0, STAND_H - self.bob, 0, 240 * g, 19 * g, idt,
+                 ax=False, az=False)
+            pull(ch, 0, STAND_H + 0.32 - self.bob, 0, 150 * g, 15 * g, idt,
+                 ax=False, az=False)
+        if gu:
+            return
+
+        tvx, tvz = self.mvx * SPEED, self.mvz * SPEED
+        gain = SERVO * (0.2 if air else 0.5)
+        for i, w in ((PELVIS, 1.0), (CHEST, 0.5)):
+            if att[i]:
+                q = p[i]
+                q.fx += q.m * gain * w * (tvx - (q.x - q.px) * idt)
+                q.fz += q.m * gain * w * (tvz - (q.z - q.pz) * idt)
+
+        self.sword_control(dt, idt, F, R)
+
+    def legs(self, dt, idt, g, gu, air, cx, cz, F, R):
+        """足運び:片足ずつ持ち上げて踏み出し、接地した足はその場に固定する"""
+        p, att = self.pt, self.att
+        walk = not (gu or air)
+        lead = STEP_T * 0.6
+        pel = p[PELVIS]
+        # 着地目標は実際の腰の位置を基準にし、脚が届く範囲に収める
+        bx = pel.x + (cx - pel.x) * 0.3
+        bz = pel.z + (cz - pel.z) * 0.3
+        tgt = {}
+        for a_i, s, fo in ((ANK_L, -1.0, -0.17), (ANK_R, 1.0, 0.17)):
+            tx = bx + R[0] * 0.12 * s + F[0] * fo + self.mvx * SPEED * lead
+            tz = bz + R[2] * 0.12 * s + F[2] * fo + self.mvz * SPEED * lead
+            dx, dz = tx - pel.x, tz - pel.z
+            dl = math.hypot(dx, dz)
+            lim = STEP_REACH - 0.03
+            if dl > lim:
+                tx, tz = pel.x + dx * lim / dl, pel.z + dz * lim / dl
+            tgt[a_i] = (tx, tz)
+        self.pins = {}
+        mv = math.hypot(self.mvx, self.mvz)
+        self.bob = WALK_CROUCH * min(1.0, mv) + self.crouch
+        if not walk:
+            for a_i in (ANK_L, ANK_R):
+                ft = self.feet[a_i]
+                ft[0], ft[1], ft[2] = p[a_i].x, p[a_i].z, None
+        else:
+            self.step_cd -= dt
+            if self.step_cd <= 0.0 and self.feet[ANK_L][2] is None \
+                    and self.feet[ANK_R][2] is None:
+                best, be = None, STEP_TRIG
+                for a_i in (ANK_L, ANK_R):
+                    if not att[a_i]:
+                        continue
+                    ft = self.feet[a_i]
+                    t = tgt[a_i]
+                    e = math.hypot(t[0] - ft[0], t[1] - ft[1])
+                    # 脚が伸び切りそうな足は優先して踏み出す
+                    if math.hypot(pel.x - ft[0], pel.z - ft[1]) > STEP_REACH:
+                        e += 1.0
+                    if e > be:
+                        best, be = a_i, e
+                if best is not None:
+                    ft = self.feet[best]
+                    ft[2] = [0.0, ft[0], ft[1]]
+        for a_i, k_i, t_i, h_i in ((ANK_L, KNEE_L, TOE_L, HIP_L),
+                                   (ANK_R, KNEE_R, TOE_R, HIP_R)):
+            if not att[a_i]:
+                continue
+            ft = self.feet[a_i]
+            tx, tz = tgt[a_i]
+            an = p[a_i]
+            lift = 0.0
+            aux = self.leg_aux.get(a_i)
+            if aux is not None:
+                aux[3] = 0.0 if (walk and ft[2] is not None) else \
+                    (0.3 if self.crouch < 0.04 else 0.03)
+            if walk and ft[2] is not None:
+                sw = ft[2]
+                sw[0] += dt / STEP_T
+                s = min(1.0, sw[0])
+                e = s * s * (3.0 - 2.0 * s)
+                fx = sw[1] + (tx - sw[1]) * e
+                fz = sw[2] + (tz - sw[2]) * e
+                lift = STEP_LIFT * math.sin(math.pi * s)
+                pull(an, fx, 0.075 + lift, fz, 520 * g, 32 * g, idt)
+                self.bob += 0.015 * math.sin(math.pi * s)
+                if s >= 1.0:
+                    ft[0], ft[1], ft[2] = fx, fz, None
+                    self.step_cd = 0.02
+            elif walk:
+                fx, fz = ft[0], ft[1]
+                if self.stun == 0 and math.hypot(pel.x - fx, pel.z - fz) < 0.34:
+                    self.pins[a_i] = (fx, fz)       # 摩擦で固定(体の方が足を支点に進む)
+                else:
+                    pull(an, fx, 0, fz, 320 * g, 30 * g, idt, ay=False)
+            else:
+                fx, fz = tx, tz
+                pull(an, fx, 0, fz, 240 * g, 21 * g, idt, ay=False)
+            hp_ = p[h_i]
+            kx = (fx + hp_.x) * 0.5 + F[0] * 0.10
+            kz = (fz + hp_.z) * 0.5 + F[2] * 0.10
+            if lift > 0.0:
+                pull(p[k_i], kx + F[0] * 0.06, 0.52 + lift * 0.8, kz + F[2] * 0.06,
+                     140 * g, 12 * g, idt)
+            else:
+                pull(p[k_i], kx, 0, kz, 100 * g, 10 * g, idt, ay=False)
+            if att[t_i]:
+                pull(p[t_i], an.x + F[0] * 0.15, 0.03 + lift * 0.6,
+                     an.z + F[2] * 0.15, 90 * g, 9 * g, idt)
+
+    def sword_control(self, dt, idt, F, R):
+        p, att = self.pt, self.att
+        ch = p[CHEST]
+        hands = [h for h in (HAND_R, HAND_L) if att[h] and h in self.grip_hands]
+        if not self.armed or not hands:
+            for h in (HAND_L, HAND_R):
+                if att[h]:
+                    pull(p[h], ch.x + F[0] * 0.10, ch.y - 0.38,
+                         ch.z + F[2] * 0.10, 40, 6, idt)
+            return
+        goal = self.sword_goal()
+        if goal is None:
+            goal = self.guard_tip()
+        d = sub(goal, self.T)
+        l = length(d)
+        mx = ARM_V * dt
+        T = add(self.T, mul(d, mx / l)) if l > mx else goal
+        G, T = self.solve_grip(T)
+        self.T = T
+        bd = norm(sub(T, G))
+        k = 0.45 if self.stun > 0 else 1.0
+        pull_rel(p[TIP], ch, T, 650 * k, 30, idt, 0.20)
+        pull_rel(p[GRIP], ch, G, 520 * k, 28, idt, 0.30)
+        for h, off in ((HAND_R, 0.035), (HAND_L, 0.13)):
+            if h in hands:
+                pull_rel(p[h], ch, sub(G, mul(bd, off)), 380 * k, 26, idt, 0.30)
+        for s_i, e_i, h_i, sg in ((SHO_L, ELB_L, HAND_L, -1.0),
+                                  (SHO_R, ELB_R, HAND_R, 1.0)):
+            if att[s_i] and att[e_i] and att[h_i]:
+                s, h = p[s_i], p[h_i]
+                pull(p[e_i],
+                     (s.x + h.x) * 0.5 + R[0] * 0.05 * sg - F[0] * 0.03,
+                     (s.y + h.y) * 0.5 - 0.07,
+                     (s.z + h.z) * 0.5 + R[2] * 0.05 * sg - F[2] * 0.03,
+                     80, 8, idt)
+
+    # ---------- 毎フレーム ----------
+    def timers(self, dt):
+        pel = self.pt[PELVIS]
+        if self.stun > 0:
+            self.stun -= 1
+        if self.parry_t > 0:
+            self.parry_t -= 1
+        if self.thrust_t > 0.0:
+            self.thrust_t -= dt
+        for k in list(self.hit_cd):
+            self.hit_cd[k] -= 1
+            if self.hit_cd[k] <= 0:
+                del self.hit_cd[k]
+
+        if self.down > 0 or self.stun > 0:
+            self.anc_x, self.anc_z = pel.x, pel.z
+        if self.down > 0:
+            self.down -= 1
+            if self.down == 0 and self.alive():
+                self.getup = GETUP_F
+        elif self.getup > 0:
+            self.getup -= 1
+        if (self.alive() and self.down == 0 and self.getup == 0
+                and self.upright() < DOWN_TH):
+            self.down = DOWN_F
+
+        if self.bleed > 0.0 and not self.ko:
+            self.hurt(self.bleed * dt, 0)
+        self.hp_ghost += (self.hp - self.hp_ghost) * 0.08
+
+        g, t = self.pt[GRIP], self.pt[TIP]
+        bd = norm(sub(t.pos(), g.pos()))
+        v = t.vel(1.0 / SDT)
+        vp = sub(v, mul(bd, dot(v, bd)))
+        if length(vp) > 1.5:
+            self.edge = norm(lerp(self.edge, norm(vp), 0.35))
+        e = sub(self.edge, mul(bd, dot(self.edge, bd)))
+        if length(e) > 1e-3:
+            self.edge = norm(e)
+
+    def hurt(self, dmg, stun):
+        if self.ko:
+            return
+        self.hp = max(0.0, self.hp - dmg)
+        if stun:
+            self.stun = max(self.stun, stun)
+        if self.hp <= 0.0:
+            self.ko = True
+            self.release_sword()
+            if BLOOD:
+                self.drips.append([CHEST, 2.5, 0.3, 2.2])
+
+    def release_sword(self):
+        self.bones = [b for b in self.bones if b[4] != 'grip']
+        self.grip_hands = set()
+        self.armed = False
+        for i in (GRIP, TIP):
+            self.att[i] = False
+
+    # ---------- 血痕 ----------
+    def mark_seg(self, seg, c_axis, c_blade, rel, big):
+        """当たった点の体表面に血痕(部位ローカル座標で保持)"""
+        if not BLOOD or seg.prof is None:
+            return
+        X, Y, Z = self.seg_frame(seg) or basis_y(UP)
+        a, b = self.pt[seg.i], self.pt[seg.j]
+        mid = lerp(a.pos(), b.pos(), 0.5)
+        yl = dot(sub(c_axis, mid), Y)
+        w = sub(c_blade, c_axis)
+        mv = (dot(rel, X), dot(rel, Y), dot(rel, Z))
+        phi = math.atan2(dot(w, Z), dot(w, X))
+        n = 3 if big else 1
+        for k in range(n):
+            ph = phi + (k * 0.35 * (1 if mv[0] * math.sin(phi) < mv[2] * math.cos(phi) else -1))
+            y = yl + mv[1] * 0.004 * k + random.uniform(-0.01, 0.01)
+            u = clamp((y + seg.ys) / seg.L0 + 0.5, seg.u0, seg.u1)
+            rx, rz, cx, cz = prof_eval(PROFILES[seg.prof], u)
+            c, s = math.cos(ph), math.sin(ph)
+            nrm = norm((c / rx, 0.0, s / rz))
+            pos = (cx + rx * c + nrm[0] * 0.0025, y, cz + rz * s + nrm[2] * 0.0025)
+            size = (0.055 if big else 0.032) * (1.0 - 0.3 * k) * random.uniform(0.8, 1.2)
+            seg.marks.append((pos, nrm, size, random.randrange(4)))
+        if len(seg.marks) > 10:
+            del seg.marks[:len(seg.marks) - 10]
+            seg.mrk_n = min(seg.mrk_n, 0)
+
+    def mark_head(self, c_blade, big):
+        if not BLOOD:
+            return
+        X, Y, Z = self.head_frame()
+        v = sub(c_blade, self.pt[HEAD].pos())
+        d = norm((dot(v, X), dot(v, Y), dot(v, Z)))
+        if d == (0.0, 0.0, 0.0):
+            return
+        p = add(head_point(d), mul(d, 0.004))
+        self.head_marks.append((p, d, 0.05 if big else 0.03, random.randrange(4)))
+
+    def mark_sword(self, s):
+        if BLOOD and len(self.sword_marks) < 10:
+            self.sword_marks.append((BLADE * (0.12 + 0.88 * s) + random.uniform(-0.03, 0.03),
+                                     random.randrange(4)))
+
+    # ---------- 切断 ----------
+    def sever(self, seg, t):
+        """部位 seg を位置 t で断つ。骨を 2 本に分け、断面の点を 2 つ作る"""
+        a, b = seg.i, seg.j
+        pa, pb = self.pt[a], self.pt[b]
+        bone = None
+        for bn in self.bones:
+            if bn[4] == 'struct' and ((bn[0] == a and bn[1] == b) or
+                                      (bn[0] == b and bn[1] == a)):
+                bone = bn
+                break
+        if bone is None:
+            return None
+        t = clamp(t, 0.18, 0.82)
+        C = lerp(pa.pos(), pb.pos(), t)
+        V = lerp((pa.x - pa.px, pa.y - pa.py, pa.z - pa.pz),
+                 (pb.x - pb.px, pb.y - pb.py, pb.z - pb.pz), t)
+        d = norm(sub(pb.pos(), pa.pos()))
+        c1 = len(self.pt)
+        c2 = c1 + 1
+        for idx, off in ((c1, -0.006), (c2, 0.006)):
+            q = Pt(add(C, mul(d, off)), 0.3, seg.r * 0.8)
+            q.px, q.py, q.pz = q.x - V[0], q.y - V[1], q.z - V[2]
+            self.pt.append(q)
+            self.att.append(True)
+        rest = bone[2]
+        self.bones.remove(bone)
+        self.bones.append([a, c1, rest * t, 1.0, 'struct'])
+        self.bones.append([c2, b, rest * (1.0 - t), 1.0, 'struct'])
+
+        # 見た目:元の形を t で 2 つに分け、断面を付ける。血痕も引き継ぐ
+        L0 = seg.L0
+        ys1 = (t * 0.5 - 0.5) * L0
+        ys2 = ((1.0 + t) * 0.5 - 0.5) * L0
+        s1 = self.new_seg(a, c1, seg.r, seg.mat, seg.part, False, seg.prof, L0,
+                          seg.u0, t, ys1, seg.cap0, 'cut')
+        s2 = self.new_seg(c2, b, seg.r, seg.mat, seg.part, False, seg.prof, L0,
+                          t, seg.u1, ys2, 'cut', seg.cap1)
+        for s in (s1, s2):
+            s.zref = seg.zref
+            s.frame = seg.frame
+        ycut = (t - 0.5) * L0
+        for m in seg.marks:
+            pos = m[0]
+            if pos[1] <= ycut:
+                s1.marks.append(((pos[0], pos[1] - ys1, pos[2]),) + m[1:])
+            else:
+                s2.marks.append(((pos[0], pos[1] - ys2, pos[2]),) + m[1:])
+        seg.dead = True
+        self.segs.append(s1)
+        self.segs.append(s2)
+        self.lost.add(seg.part)
+        if BLOOD:
+            self.drips.append([c1, 6.0, 0.05, 1.2])
+            self.drips.append([c2, 3.0, 0.05, 1.0])
+        self.recompute()
+        return C
+
+    def recompute(self):
+        """構造の骨だけで連結成分を求め、成分を跨ぐ補助・拘束を外す"""
+        n = len(self.pt)
+        adj = [[] for _ in range(n)]
+        for a, b, rest, k, tag in self.bones:
+            if tag == 'struct':
+                adj[a].append(b)
+                adj[b].append(a)
+        comp = [-1] * n
+        c = 0
+        for s in range(n):
+            if comp[s] >= 0:
+                continue
+            stack = [s]
+            comp[s] = c
+            while stack:
+                u = stack.pop()
+                for v in adj[u]:
+                    if comp[v] < 0:
+                        comp[v] = c
+                        stack.append(v)
+            c += 1
+        body = comp[PELVIS]
+        keep = []
+        hands = set()
+        for bn in self.bones:
+            a, b, rest, k, tag = bn
+            if tag == 'grip':
+                if comp[a] == body and self.armed:
+                    keep.append(bn)
+                    hands.add(a)
+            elif tag == 'aux':
+                if comp[a] == comp[b]:
+                    keep.append(bn)
+            else:
+                keep.append(bn)
+        self.bones = keep
+        self.grip_hands = hands
+        if not hands:
+            self.armed = False
+        lim = []
+        for L in self.limits:
+            ids = L[1:4] if L[0] == 'knee' else L[1:3]
+            if all(comp[i] == comp[ids[0]] for i in ids) and comp[ids[0]] == body:
+                lim.append(L)
+        self.limits = lim
+        for i in range(n):
+            self.att[i] = comp[i] == body or (self.armed and comp[i] == comp[GRIP])
+        for i in (KNEE_L, ANK_L, KNEE_R, ANK_R):
+            if comp[i] != body:
+                self.crippled = True
+
+
+# =====================================================================
+# CPU
+# =====================================================================
+class AI(object):
+    WINDUP = 0.30
+    STRIKE = 0.24
+
+    def __init__(self, me, foe, level):
+        self.me, self.foe, self.level = me, foe, level
+        self.state = 'approach'
+        self.t = 0.0
+        self.clock = 0.0
+        self.cool = 1.2
+        self.parry_ready = True
+        self.target = None
+        self.W = None
+        self.side = 1.0
+
+    def move(self, fwd, f_amt, r_amt):
+        R = self.me.R()
+        mx = fwd[0] * f_amt + R[0] * r_amt
+        mz = fwd[1] * f_amt + R[2] * r_amt
+        l = math.hypot(mx, mz)
+        if l > 1.0:
+            mx, mz = mx / l, mz / l
+        self.me.mvx, self.me.mvz = mx, mz
+
+    def pick(self):
+        foe = self.foe
+        cand = []
+        for s in foe.segs:
+            if s.dead or not (foe.att[s.i] and foe.att[s.j]):
+                continue
+            w = {'head': 0.12, 'neck': 0.12, 'torso': 0.12, 'farm': 0.26,
+                 'uarm': 0.14, 'thigh': 0.16, 'shin': 0.08}.get(s.part.split('_')[0], 0.0)
+            if w > 0:
+                cand.append((w, s))
+        if not cand:
+            return None
+        r = random.random() * sum(w for w, s in cand)
+        for w, s in cand:
+            r -= w
+            if r <= 0:
+                return s
+        return cand[-1][1]
+
+    def target_point(self):
+        s = self.target
+        foe = self.foe
+        if s is None or s.dead or not (foe.att[s.i] and foe.att[s.j]):
+            c = foe.pt[CHEST]
+            return (c.x, c.y, c.z)
+        a, b = foe.pt[s.i], foe.pt[s.j]
+        u = 0.62 if s.part.split('_')[0] in ('farm', 'uarm', 'thigh', 'shin') else 0.5
+        return lerp(a.pos(), b.pos(), u)
+
+    def windup_point(self):
+        me = self.me
+        S = me.shoulder_center()
+        F, R = me.F, me.R()
+        h = self.target_point()[1]
+        if self.target is not None and self.target.part == 'neck':
+            r, u, f = 0.80 * self.side, 0.12, 0.10       # 首は横薙ぎ
+        elif h > 1.25:
+            r, u, f = 0.25 * self.side, 0.62, -0.05
+        elif h > 0.75:
+            r, u, f = 0.75 * self.side, 0.15, 0.10
+        else:
+            r, u, f = 0.65 * self.side, -0.30, 0.25
+        return (S[0] + R[0] * r + F[0] * f, S[1] + u, S[2] + R[2] * r + F[2] * f)
+
+    def think(self, dt):
+        me, foe = self.me, self.foe
+        self.clock += dt
+        if not me.alive() or me.down or me.getup:
+            me.mvx = me.mvz = 0.0
+            me.T_goal = None
+            self.state = 'approach'
+            return
+        pm, pf = me.pt[PELVIS], foe.pt[PELVIS]
+        dx, dz = pf.x - pm.x, pf.z - pm.z
+        dist = math.hypot(dx, dz) or 1e-3
+        fwd = (dx / dist, dz / dist)
+        self.t += dt
+        self.cool -= dt
+
+        if not me.armed:
+            self.move(fwd, -1.0, 0.0)
+            me.T_goal = None
+            return
+        if not foe.alive():
+            self.move(fwd, 0.0, 0.0)
+            me.T_goal = None
+            return
+
+        ft = foe.pt[TIP]
+        fsp = length(ft.vel(1.0 / SDT))
+        if fsp < 2.0:
+            self.parry_ready = True
+        if (self.state in ('approach', 'recover') and self.parry_ready
+                and foe.armed and fsp > 5.0):
+            if length(sub(ft.pos(), me.pt[CHEST].pos())) < 1.35:
+                self.parry_ready = False
+                if random.random() < 0.30 * self.level:
+                    self.state, self.t = 'parry', 0.0
+
+        st = self.state
+        if st == 'approach':
+            want = 1.45
+            f_amt = 1.0 if dist > want + 0.10 else (-0.8 if dist < want - 0.30 else 0.0)
+            self.move(fwd, f_amt, 0.35 * math.sin(self.clock * 1.3))
+            me.T_goal = None
+            if self.cool <= 0.0 and dist < 1.85:
+                self.target = self.pick()
+                self.side = random.choice((-1.0, 1.0))
+                self.state, self.t = 'windup', 0.0
+        elif st == 'windup':
+            self.move(fwd, 0.0, 0.0)
+            me.T_goal = self.windup_point()
+            if self.t > self.WINDUP / self.level:
+                self.W = me.T
+                self.state, self.t = 'strike', 0.0
+        elif st == 'strike':
+            self.move(fwd, 0.9, 0.0)
+            P = self.target_point()
+            W = self.W
+            FT = add(P, mul(sub(P, W), 0.7))
+            u = self.t / self.STRIKE
+            me.T_goal = lerp(W, P, u / 0.6) if u < 0.6 else lerp(P, FT, (u - 0.6) / 0.4)
+            if self.t > self.STRIKE:
+                self.state, self.t = 'recover', 0.0
+        elif st == 'recover':
+            self.move(fwd, -0.7, 0.0)
+            me.T_goal = None
+            if self.t > 0.5:
+                self.state, self.t = 'approach', 0.0
+                self.cool = random.uniform(0.7, 1.8) / self.level
+        elif st == 'parry':
+            self.move(fwd, -0.3, 0.0)
+            M = lerp(foe.pt[GRIP].pos(), foe.pt[TIP].pos(), 0.5)
+            S = me.shoulder_center()
+            me.T_goal = add(add(S, mul(norm(sub(M, S)), 1.1)), (0.0, 0.08, 0.0))
+            if self.t > 0.32:
+                self.state, self.t = 'recover', 0.0
+
+
+# =====================================================================
+# 世界
+# =====================================================================
+class World(object):
+    MAX_GROUND = 70
+
+    def __init__(self, stage=0):
+        self.stage = stage
+        self.st = STAGES[stage]
+        self.round_no = 1
+        self.wins = [0, 0]
+        self.gen = 0
+        self.gid = 0
+        self.match = None           # 'win' / 'lose'(景の勝敗)
+        self.stats = {'time': 0.0, 'sever': 0, 'wound': 0, 'deep': 0, 'hp': []}
+        self.new_round()
+
+    def new_round(self):
+        self.player = Fighter('YOU', (-1.1, 0.0), (1.0, 0.0, 0.0), PAL_P, True)
+        self.cpu = Fighter('CPU', (1.1, 0.0), (-1.0, 0.0, 0.0), self.st['pal'], False)
+        self.player.foe, self.cpu.foe = self.cpu, self.player
+        self.ai = AI(self.cpu, self.player, CPU_LEVEL * self.st['level'])
+        self.state = 'fight'
+        self.t = 0.0
+        self.over_t = 0.0
+        self.events = []
+        self.fx = []
+        self.ground = []            # (id, x, z, 大きさ, 角度, 種類)
+        self.slowmo = 0.0
+        self.shake = 0.0
+        self.clash_cd = 0
+        self.winner = None
+        self.gen += 1
+        self.say('%s 第 %d 番 始め' % (self.st['name'], self.round_no), 2.2,
+                 (1, 0.96, 0.88))
+
+    def say(self, text, sec, col):
+        self.events.append([text, sec, col])
+        if len(self.events) > 4:
+            self.events.pop(0)
+
+    def add_ground(self, x, z, size):
+        self.gid += 1
+        self.ground.append((self.gid, x, z, size, random.uniform(0, math.pi * 2),
+                            random.randrange(4)))
+        if len(self.ground) > self.MAX_GROUND:
+            self.ground.pop(0)
+
+    # ---------- 物理 ----------
+    def integrate(self, f, dt):
+        dt2 = dt * dt
+        for q in f.pt:
+            nx = q.x + (q.x - q.px) * DAMP + q.fx * q.im * dt2
+            ny = q.y + (q.y - q.py) * DAMP + (q.fy * q.im + GRAV) * dt2
+            nz = q.z + (q.z - q.pz) * DAMP + q.fz * q.im * dt2
+            q.px, q.py, q.pz = q.x, q.y, q.z
+            q.x, q.y, q.z = nx, ny, nz
+            q.fx = q.fy = q.fz = 0.0
+
+    def constrain(self, f):
+        pt = f.pt
+        F = f.F
+        for _ in range(ITER):
+            for a_i, b_i, rest, k, tag in f.bones:
+                a, b = pt[a_i], pt[b_i]
+                dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+                d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                if d < 1e-9:
+                    continue
+                w = a.im + b.im
+                c = (d - rest) / (d * w) * k
+                a.x += dx * c * a.im
+                a.y += dy * c * a.im
+                a.z += dz * c * a.im
+                b.x -= dx * c * b.im
+                b.y -= dy * c * b.im
+                b.z -= dz * c * b.im
+            for a_i, (px_, pz_) in f.pins.items():
+                q = pt[a_i]
+                q.x += (px_ - q.x) * 0.6
+                q.z += (pz_ - q.z) * 0.6
+            for L in f.limits:
+                kind = L[0]
+                if kind == 'knee':
+                    h, kn, an, marg = pt[L[1]], pt[L[2]], pt[L[3]], L[4]
+                    ux, uy, uz = an.x - h.x, an.y - h.y, an.z - h.z
+                    uu = ux * ux + uy * uy + uz * uz
+                    if uu < 1e-9:
+                        continue
+                    s = ((kn.x - h.x) * ux + (kn.y - h.y) * uy + (kn.z - h.z) * uz) / uu
+                    vx = kn.x - (h.x + ux * s)
+                    vz = kn.z - (h.z + uz * s)
+                    fwd = vx * F[0] + vz * F[2]
+                    if fwd >= marg:
+                        continue
+                    dlt = marg - fwd
+                    tot = kn.im + 0.5 * (h.im + an.im)
+                    wk = dlt * kn.im / tot
+                    wo = dlt * 0.5 / tot
+                    kn.x += F[0] * wk
+                    kn.z += F[2] * wk
+                    h.x -= F[0] * wo * h.im
+                    h.z -= F[2] * wo * h.im
+                    an.x -= F[0] * wo * an.im
+                    an.z -= F[2] * wo * an.im
+                else:
+                    a, b, lim = pt[L[1]], pt[L[2]], L[3]
+                    dx, dy, dz = b.x - a.x, b.y - a.y, b.z - a.z
+                    d = math.sqrt(dx * dx + dy * dy + dz * dz)
+                    if d < 1e-9:
+                        continue
+                    if kind == 'max' and d <= lim:
+                        continue
+                    if kind == 'min' and d >= lim:
+                        continue
+                    w = a.im + b.im
+                    c = (d - lim) / (d * w)
+                    a.x += dx * c * a.im
+                    a.y += dy * c * a.im
+                    a.z += dz * c * a.im
+                    b.x -= dx * c * b.im
+                    b.y -= dy * c * b.im
+                    b.z -= dz * c * b.im
+        for q in pt:
+            if q.y < q.r:
+                vy = q.y - q.py
+                q.y = q.r
+                q.py = q.y + vy * 0.1 if vy < 0 else q.py
+                q.px = q.x - (q.x - q.px) * GROUND_FRIC
+                q.pz = q.z - (q.z - q.pz) * GROUND_FRIC
+            r = math.hypot(q.x, q.z)
+            if r > ARENA_R:
+                s = ARENA_R / r
+                q.x *= s
+                q.z *= s
+
+    @staticmethod
+    def seg_pts(f, seg, t):
+        if seg.i == seg.j:
+            return [(f.pt[seg.i], 1.0)]
+        return [(f.pt[seg.i], 1.0 - t), (f.pt[seg.j], t)]
+
+    def body_collide(self, A, B):
+        """二人の全部位(死体・切断片を含む)をカプセル同士で押し合う"""
+        def bounds(f):
+            out = []
+            for s in f.segs:
+                if s.dead:
+                    continue
+                a, b = f.pt[s.i], f.pt[s.j]
+                pa, pb = (a.x, a.y, a.z), (b.x, b.y, b.z)
+                c = ((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5)
+                hl = math.sqrt((b.x - a.x) ** 2 + (b.y - a.y) ** 2 + (b.z - a.z) ** 2) * 0.5
+                out.append((s, pa, pb, c, hl + s.r))
+            return out
+        la, lb = bounds(A), bounds(B)
+        for sa, pa, qa, ca, ra in la:
+            for sb, pb, qb, cb, rb in lb:
+                dx, dy, dz = cb[0] - ca[0], cb[1] - ca[1], cb[2] - ca[2]
+                lim = ra + rb
+                if dx * dx + dy * dy + dz * dz > lim * lim:
+                    continue
+                s, u, c1, c2 = seg_seg(pa, qa, pb, qb)
+                dv = sub(c2, c1)
+                d = length(dv)
+                R = sa.r + sb.r
+                if d >= R:
+                    continue
+                n = norm(dv) if d > 1e-6 else (1.0, 0.0, 0.0)
+                self.push_pair(n, (R - d), self.seg_pts(A, sa, s),
+                               self.seg_pts(B, sb, u))
+
+    @staticmethod
+    def push_pair(n, over, pts_a, pts_b):
+        wa = sum(w * w * q.im for q, w in pts_a)
+        wb = sum(w * w * q.im for q, w in pts_b)
+        if wa + wb <= 0.0:
+            return
+        lam = over / (wa + wb)
+        for q, w in pts_a:
+            c = lam * w * q.im
+            q.x -= n[0] * c
+            q.y -= n[1] * c
+            q.z -= n[2] * c
+        for q, w in pts_b:
+            c = lam * w * q.im
+            q.x += n[0] * c
+            q.y += n[1] * c
+            q.z += n[2] * c
+
+    @staticmethod
+    def slow_blade(ga, ta, k):
+        for q in (ga, ta):
+            q.px = q.x - (q.x - q.px) * k
+            q.py = q.y - (q.y - q.py) * k
+            q.pz = q.z - (q.z - q.pz) * k
+
+    def blade_blade(self, A, B):
+        if not (A.armed and B.armed):
+            return
+        ga, ta, gb, tb = A.pt[GRIP], A.pt[TIP], B.pt[GRIP], B.pt[TIP]
+        s, u, c1, c2 = seg_seg(ga.pos(), ta.pos(), gb.pos(), tb.pos())
+        dv = sub(c2, c1)
+        d = length(dv)
+        R = 0.03
+        if d >= R:
+            return
+        n = norm(dv) if d > 1e-6 else norm(cross(sub(ta.pos(), ga.pos()), UP))
+        idt = 1.0 / SDT
+        va = lerp(ga.vel(idt), ta.vel(idt), s)
+        vb = lerp(gb.vel(idt), tb.vel(idt), u)
+        rel = length(sub(va, vb))
+        self.push_pair(n, R - d, [(ga, 1 - s), (ta, s)], [(gb, 1 - u), (tb, u)])
+        if rel > 2.5 and self.clash_cd <= 0:
+            self.clash_cd = 8
+            A.parry_t = max(A.parry_t, 10)
+            B.parry_t = max(B.parry_t, 10)
+            self.fx.append(('spark', lerp(c1, c2, 0.5), n))
+            self.shake = max(self.shake, 0.012)
+
+    def blade_body(self, A, D):
+        if not A.armed or not A.alive():
+            return
+        ga, ta = A.pt[GRIP], A.pt[TIP]
+        idt = 1.0 / SDT
+        g0, t0 = ga.pos(), ta.pos()
+        b0 = lerp(g0, t0, 0.12)
+        # 接触を先に集め、細い部位(首・腕)から処理する。
+        # 太い胴の判定が首や腕を覆っていても、具体的な部位が優先される
+        hits = []
+        for seg in D.segs:
+            if seg.dead:
+                continue
+            pi, pj = D.pt[seg.i].pos(), D.pt[seg.j].pos()
+            s, u, c1, c2 = seg_seg(b0, t0, pi, pj)
+            if length(sub(c2, c1)) < seg.r + 0.012:
+                hits.append(seg)
+        hits.sort(key=lambda sg: sg.r)
+        struck = False
+        for seg in hits:
+            if seg.dead:
+                continue
+            g0, t0 = ga.pos(), ta.pos()
+            b0 = lerp(g0, t0, 0.12)
+            bd = norm(sub(t0, g0))
+            gv, tv = ga.vel(idt), ta.vel(idt)
+            qi, qj = D.pt[seg.i], D.pt[seg.j]
+            pi, pj = qi.pos(), qj.pos()
+            s, u, c1, c2 = seg_seg(b0, t0, pi, pj)
+            dv = sub(c2, c1)
+            dist = length(dv)
+            rad = seg.r + 0.012
+            if dist >= rad:
+                continue
+            sb = 0.12 + 0.88 * s
+            vb = lerp(gv, tv, sb)
+            vl = lerp(qi.vel(idt), qj.vel(idt), u)
+            rel = sub(vb, vl)
+            ld = norm(sub(pj, pi))
+            rp = sub(rel, mul(ld, dot(rel, ld)))
+            cut_v = length(sub(rp, mul(bd, dot(rp, bd)))) + 0.3 * abs(dot(rel, bd))
+            base = seg.part.split('_')[0]
+            attached = D.att[seg.i] and D.att[seg.j]
+            if not struck and A.hit_cd.get(seg.key, 0) == 0 and A.parry_t == 0:
+                if seg.sever and attached and cut_v >= WOUND_V.get(base, 99.0):
+                    struck = True
+                    A.hit_cd[seg.key] = 24
+                    D.wounds[seg.part] = D.wounds.get(seg.part, 0) + 1
+                    D.mark_seg(seg, c2, c1, rel, True)
+                    A.mark_sword(s)
+                    if D.wounds[seg.part] >= WOUNDS_TO_SEVER:
+                        C = D.sever(seg, u)
+                        if C:
+                            self.on_sever(A, D, seg, C, rel)
+                            self.slow_blade(ga, ta, 0.55)
+                            continue
+                    self.on_wound(A, D, seg, c2, rel, qi, qj, u)
+                    self.slow_blade(ga, ta, 0.82)   # 肉を裂いて刃は抜ける
+                    continue
+                if cut_v >= HIT_V:
+                    struck = True
+                    A.hit_cd[seg.key] = 18
+                    self.on_hit(A, D, seg, base, cut_v, c1, c2, rel, qi, qj, u,
+                                attached)
+                    A.mark_sword(s)
+            if struck and seg.r > 0.12:
+                continue            # 既に斬った刃を胴の判定で押し戻さない
+            # 斬れない速さなら刃は体に止められる
+            n = norm(dv) if dist > 1e-6 else norm(cross(bd, UP))
+            self.push_pair(n, rad - dist, [(ga, 1 - sb), (ta, sb)],
+                           [(qi, 1 - u), (qj, u)])
+
+    def knock(self, rel, qi, qj, u, k):
+        k = min(1.0, 3.0 / (length(rel) + 1e-6)) * k
+        for q, w in ((qi, 1 - u), (qj, u)):
+            q.px -= rel[0] * k * w * SDT
+            q.py -= rel[1] * k * w * SDT
+            q.pz -= rel[2] * k * w * SDT
+
+    def who(self, D):
+        return '敵' if D is self.cpu else '己'
+
+    def on_hit(self, A, D, seg, base, v, c_blade, c_axis, rel, qi, qj, u, attached):
+        live = D.alive() and attached
+        if base == 'head':
+            D.mark_head(c_blade, v >= HEAD_V)
+        else:
+            D.mark_seg(seg, c_axis, c_blade, rel, v >= TORSO_V)
+        self.fx.append(('hit', c_axis, norm(rel)))
+        if not live:
+            # 死体や切り落とされた部位:傷も体力も無く、刃に弾かれて動くだけ
+            self.knock(rel, qi, qj, u, 0.7)
+            return
+        deep = False
+        if base == 'head':
+            deep = v >= HEAD_V
+            dmg = 30.0 if deep else (v - HIT_V) * 6.0
+            stun = 20 if deep else 8
+        elif base == 'torso':
+            deep = v >= TORSO_V
+            dmg = 18.0 if deep else (v - HIT_V) * 4.0
+            stun = 12 if deep else 5
+        else:
+            dmg = (v - HIT_V) * 2.5
+            stun = 4
+        dmg = clamp(dmg, 1.5, 40.0)
+        D.hurt(dmg, stun)
+        self.knock(rel, qi, qj, u, 0.25)
+        self.shake = max(self.shake, 0.02 if deep else 0.008)
+        if deep:
+            if A.is_player:
+                self.stats['deep'] += 1
+            self.say('%sの%s 深手' % (self.who(D), PART_JP.get(seg.part, '')),
+                     1.2, A.pal['hud'])
+            if BLOOD:
+                D.drips.append([seg.j if base == 'head' else CHEST, 1.5, 0.1, 0.8])
+
+    def on_wound(self, A, D, seg, pos, rel, qi, qj, u):
+        n = D.wounds[seg.part]
+        neck = seg.part == 'neck'
+        self.knock(rel, qi, qj, u, 0.18)
+        self.fx.append(('hit', pos, norm(rel)))
+        if BLOOD:
+            D.drips.append([seg.i if u < 0.5 else seg.j, 1.6, 0.1, 0.7])
+        if not D.alive():
+            return
+        D.hurt(12.0 if neck else 6.0, 8)
+        D.bleed += 1.2 if neck else 0.35
+        self.shake = max(self.shake, 0.012)
+        if A.is_player:
+            self.stats['wound'] += 1
+        self.say('%sの%sに傷 %d/%d' % (self.who(D), PART_JP.get(seg.part, ''),
+                                     n, WOUNDS_TO_SEVER), 1.3, A.pal['hud'])
+
+    def on_sever(self, A, D, seg, C, rel):
+        base = seg.part.split('_')[0]
+        self.fx.append(('cut', C, norm(rel)))
+        self.shake = max(self.shake, 0.03)
+        if not D.alive():
+            return
+        self.slowmo = 0.6
+        if A.is_player:
+            self.stats['sever'] += 1
+        self.say('%sの%s 両断' % (self.who(D), PART_JP.get(seg.part, '')),
+                 1.8, A.pal['hud'])
+        if base == 'neck':
+            D.hurt(999.0, 0)
+            return
+        D.bleed += 9.0 if D.crippled else 2.5
+        D.hurt(30.0 if base in ('thigh', 'shin') else 16.0, 18)
+
+    # ---------- 1 フレーム ----------
+    def step(self):
+        P, C = self.player, self.cpu
+        self.t += DT
+        if self.state == 'fight':
+            self.stats['time'] += DT
+            self.ai.think(DT)
+        else:
+            self.over_t += DT
+            C.mvx = C.mvz = 0.0
+        for _ in range(SUB):
+            P.control(C, SDT)
+            C.control(P, SDT)
+            self.integrate(P, SDT)
+            self.integrate(C, SDT)
+            self.constrain(P)
+            self.constrain(C)
+            self.body_collide(P, C)
+            self.blade_blade(P, C)
+            self.blade_body(P, C)
+            self.blade_body(C, P)
+        P.timers(DT)
+        C.timers(DT)
+        for f in (P, C):
+            keep = []
+            for d in f.drips:
+                d[1] -= DT
+                d[2] -= DT
+                if d[2] <= 0.0:
+                    d[2] = random.uniform(0.10, 0.28)
+                    q = f.pt[d[0]]
+                    if q.y < 2.0:
+                        self.add_ground(q.x + random.uniform(-0.05, 0.05),
+                                        q.z + random.uniform(-0.05, 0.05),
+                                        random.uniform(0.03, 0.07) * d[3])
+                if d[1] > 0.0:
+                    keep.append(d)
+            f.drips = keep
+        if self.clash_cd > 0:
+            self.clash_cd -= 1
+        self.shake *= 0.86
+        for e in self.events:
+            e[1] -= DT
+        self.events = [e for e in self.events if e[1] > 0]
+
+        if self.state == 'fight':
+            lose_p = not P.alive()
+            lose_c = not C.alive()
+            if lose_p or lose_c:
+                self.state = 'over'
+                self.over_t = 0.0
+                if lose_c and not lose_p:
+                    self.wins[0] += 1
+                    self.winner = P
+                    self.stats['hp'].append(P.hp)
+                    self.say('一本!', 99, (1.0, 0.95, 0.8))
+                elif lose_p and not lose_c:
+                    self.wins[1] += 1
+                    self.winner = C
+                    self.say('無念...', 99, (1.0, 0.75, 0.7))
+                else:
+                    self.say('相討ち', 99, (1, 1, 1))
+                if self.wins[0] >= WIN_ROUNDS:
+                    self.match = 'win'
+                elif self.wins[1] >= WIN_ROUNDS:
+                    self.match = 'lose'
+
+    def next_round(self):
+        self.round_no += 1
+        self.new_round()
+
+    def redo_round(self):
+        self.new_round()
+
+
+# =====================================================================
+# カメラ
+# =====================================================================
+class Camera(object):
+    FOV_TPS = 55.0
+    FOV_FPS = 72.0
+
+    def __init__(self):
+        self.pos = (-3.6, 1.85, 0.8)
+        self.look = (0.0, 1.15, 0.0)
+        self.fw = (1.0, 0.0, 0.0)
+        self.right = (0.0, 0.0, 1.0)
+        self.up = UP
+        self.jitter = (0.0, 0.0, 0.0)
+        self.set_mode('tps')
+
+    def set_mode(self, mode):
+        self.mode = mode
+        self.fov = self.FOV_FPS if mode == 'fps' else self.FOV_TPS
+        self.th = math.tan(math.radians(self.fov) * 0.5)
+
+    def fps_active(self, world):
+        P = world.player
+        return self.mode == 'fps' and P.alive() and P.att[HEAD]
+
+    def update(self, world, dt):
+        P, C = world.player, world.cpu
+        pc, cc = P.pt[CHEST], C.pt[CHEST]
+        F = P.F
+        if self.fps_active(world):
+            # 一人称:目の位置から、正面やや下と相手の胸の間を見る
+            hd = P.pt[HEAD]
+            want = (hd.x + F[0] * 0.10, hd.y + 0.035, hd.z + F[2] * 0.10)
+            ahead = (want[0] + F[0] * 2.0, want[1] - 0.35, want[2] + F[2] * 2.0)
+            look = lerp(ahead, (cc.x, cc.y, cc.z), 0.35)
+            k = 1.0 - math.exp(-dt * 25.0)
+        else:
+            R = (-F[2], 0.0, F[0])
+            want = (pc.x - F[0] * 2.35 + R[0] * 0.75, 1.82,
+                    pc.z - F[2] * 2.35 + R[2] * 0.75)
+            look = (pc.x + (cc.x - pc.x) * 0.55, 1.15, pc.z + (cc.z - pc.z) * 0.55)
+            k = 1.0 - math.exp(-dt * 6.0)
+        self.pos = lerp(self.pos, want, k)
+        self.look = lerp(self.look, look, k)
+        sh = world.shake
+        self.jitter = ((random.random() - 0.5) * sh, (random.random() - 0.5) * sh,
+                       (random.random() - 0.5) * sh)
+        fw = norm(sub(self.look, self.pos))
+        right = norm(cross(fw, UP))
+        self.fw, self.right, self.up = fw, right, cross(right, fw)
+
+    def eye(self):
+        return add(self.pos, self.jitter)
+
+    def quat(self):
+        return quat_from_basis(self.right, self.up, mul(self.fw, -1.0))
+
+    def ray(self, sx, sy, W, H):
+        nx = 2.0 * sx / W - 1.0
+        ny = 1.0 - 2.0 * sy / H
+        a = W / float(H)
+        return norm(add(self.fw, add(mul(self.right, nx * self.th * a),
+                                     mul(self.up, ny * self.th))))
+
+    def project(self, p, W, H):
+        v = sub(p, self.pos)
+        z = dot(v, self.fw)
+        if z < 1e-3:
+            return None
+        a = W / float(H)
+        x = dot(v, self.right) / (z * self.th * a)
+        y = dot(v, self.up) / (z * self.th)
+        return ((x + 1.0) * W * 0.5, (1.0 - y) * H * 0.5, z)
+
+    def drag_target(self, fighter, sx, sy, W, H):
+        """指の位置 → 剣先の目標(プレイヤー前方 1.15m の画面平行面上)"""
+        d = self.ray(sx, sy, W, H)
+        c = fighter.pt[CHEST]
+        F = fighter.F
+        P0 = (c.x + F[0] * 1.15, c.y, c.z + F[2] * 1.15)
+        n = self.fw
+        den = dot(d, n)
+        if abs(den) < 1e-6:
+            return None
+        t = dot(sub(P0, self.pos), n) / den
+        return add(self.pos, mul(d, t))
+
+
+# =====================================================================
+# SceneKit 描画
+# =====================================================================
+SCNView = ObjCClass('SCNView')
+SCNScene = ObjCClass('SCNScene')
+SCNNode = ObjCClass('SCNNode')
+SCNCamera = ObjCClass('SCNCamera')
+SCNLight = ObjCClass('SCNLight')
+SCNMaterial = ObjCClass('SCNMaterial')
+SCNGeometry = ObjCClass('SCNGeometry')
+SCNGeometrySource = ObjCClass('SCNGeometrySource')
+SCNGeometryElement = ObjCClass('SCNGeometryElement')
+SCNSphere = ObjCClass('SCNSphere')
+SCNCapsule = ObjCClass('SCNCapsule')
+SCNCylinder = ObjCClass('SCNCylinder')
+SCNBox = ObjCClass('SCNBox')
+SCNCone = ObjCClass('SCNCone')
+SCNPlane = ObjCClass('SCNPlane')
+SCNTorus = ObjCClass('SCNTorus')
+SCNPyramid = ObjCClass('SCNPyramid')
+SCNParticleSystem = ObjCClass('SCNParticleSystem')
+SCNTransaction = ObjCClass('SCNTransaction')
+SCNBillboardConstraint = ObjCClass('SCNBillboardConstraint')
+UIColor = ObjCClass('UIColor')
+NSData = ObjCClass('NSData')
+NSMutableData = ObjCClass('NSMutableData')
+
+MESH_ERR = []          # 独自メッシュが作れなかったときの原因(画面に表示)
+
+
+class V3(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_float), ('y', ctypes.c_float), ('z', ctypes.c_float)]
+
+
+class V4(ctypes.Structure):
+    _fields_ = [('x', ctypes.c_float), ('y', ctypes.c_float),
+                ('z', ctypes.c_float), ('w', ctypes.c_float)]
+
+
+def set_pos(node, p):
+    node.setPosition_(V3(p[0], p[1], p[2]), restype=None, argtypes=[V3])
+
+
+def set_rot(node, q):
+    node.setOrientation_(V4(q[0], q[1], q[2], q[3]), restype=None, argtypes=[V4])
+
+
+def set_euler(node, x, y, z):
+    node.setEulerAngles_(V3(x, y, z), restype=None, argtypes=[V3])
+
+
+def set_scale(node, x, y, z):
+    node.setScale_(V3(x, y, z), restype=None, argtypes=[V3])
+
+
+def color(rgb, a=1.0):
+    return UIColor.colorWithRed_green_blue_alpha_(rgb[0], rgb[1], rgb[2], a)
+
+
+def opt(fn, *args):
+    try:
+        fn(*args)
+    except Exception:
+        pass
+
+
+def nsdata(b):
+    """bytes → NSData。ポインタ引数を使わない方式から順に試す"""
+    n = len(b)
+    try:
+        d = NSMutableData.dataWithLength_(n)
+        ptr = d.mutableBytes()
+        if isinstance(ptr, int) and ptr:
+            ctypes.memmove(ptr, b, n)
+            return d
+    except Exception as e:
+        MESH_ERR.append('mutable: %r' % (e,))
+    try:
+        d = ns(b)
+        if d is not None and not isinstance(d, (bytes, bytearray)):
+            return d
+    except Exception as e:
+        MESH_ERR.append('ns: %r' % (e,))
+    buf = ctypes.create_string_buffer(b, n)
+    ptr = NSData.dataWithBytes_length_(ctypes.addressof(buf), n,
+                                       restype=ctypes.c_void_p,
+                                       argtypes=[ctypes.c_void_p, ctypes.c_ulong])
+    return ObjCInstance(ptr)
+
+
+def _semantic(sym, fallback):
+    try:
+        return ObjCInstance(ctypes.c_void_p.in_dll(objc_util.c, sym).value)
+    except Exception:
+        return ns(fallback)
+
+
+SEM_V = _semantic('SCNGeometrySourceSemanticVertex', 'kGeometrySourceSemanticVertex')
+SEM_N = _semantic('SCNGeometrySourceSemanticNormal', 'kGeometrySourceSemanticNormal')
+
+
+def _sources_by_data(verts, normals):
+    n = len(verts)
+    fv = [c for v in verts for c in v]
+    fn = [c for v in normals for c in v]
+    dv = nsdata(struct.pack('<%df' % len(fv), *fv))
+    dn = nsdata(struct.pack('<%df' % len(fn), *fn))
+    mk = SCNGeometrySource.geometrySourceWithData_semantic_vectorCount_floatComponents_componentsPerVector_bytesPerComponent_dataOffset_dataStride_
+    return [mk(dv, SEM_V, n, True, 3, 4, 0, 12), mk(dn, SEM_N, n, True, 3, 4, 0, 12)]
+
+
+def _sources_by_vectors(verts, normals):
+    n = len(verts)
+    va = (V3 * n)(*[V3(*v) for v in verts])
+    na = (V3 * n)(*[V3(*v) for v in normals])
+    sv = SCNGeometrySource.geometrySourceWithVertices_count_(
+        ctypes.addressof(va), n, restype=ctypes.c_void_p,
+        argtypes=[ctypes.c_void_p, ctypes.c_long])
+    sn = SCNGeometrySource.geometrySourceWithNormals_count_(
+        ctypes.addressof(na), n, restype=ctypes.c_void_p,
+        argtypes=[ctypes.c_void_p, ctypes.c_long])
+    return [ObjCInstance(sv), ObjCInstance(sn)]
+
+
+def make_geometry(verts, groups, normals=None):
+    """頂点・三角形 → SCNGeometry(三角形グループごとに材質を割り当てられる)"""
+    if normals is None:
+        normals = vnormals(verts, groups)
+    n = len(verts)
+    try:
+        srcs = _sources_by_data(verts, normals)
+    except Exception as e:
+        MESH_ERR.append('source(data): %r' % (e,))
+        srcs = _sources_by_vectors(verts, normals)
+    els = []
+    fmt, bpi = ('H', 2) if n < 65535 else ('I', 4)
+    for g in groups:
+        if not g:
+            g = [(0, 0, 0)]
+        flat = [i for t in g for i in t]
+        di = nsdata(struct.pack('<%d%s' % (len(flat), fmt), *flat))
+        els.append(SCNGeometryElement.geometryElementWithData_primitiveType_primitiveCount_bytesPerIndex_(
+            di, 0, len(g), bpi))
+    geo = SCNGeometry.geometryWithSources_elements_(srcs, els)
+    if geo is None:
+        raise ValueError('geometryWithSources が nil')
+    return geo
+
+
+# ---------- 手続き的テクスチャ ----------
+def tex_sky(cols, cloud):
+    W, H = 1024, 512
+    top, mid, hor, low = cols
+    with ui.ImageContext(W, H) as ctx:
+        N = 64
+        for i in range(N):
+            v = i / float(N - 1)
+            if v < 0.5:
+                t = v / 0.5
+                c = lerp(top, mid, t ** 1.4) if t < 0.7 else lerp(mid, hor, (t - 0.7) / 0.3)
+            else:
+                c = lerp(hor, low, min(1.0, (v - 0.5) / 0.12))
+            ui.set_color(c)
+            ui.Path.rect(0, H * i / N - 1, W, H / float(N) + 2).fill()
+        rnd = random.Random(7)
+        for _ in range(26):
+            cy = rnd.uniform(H * 0.18, H * 0.47)
+            cw = rnd.uniform(90, 360)
+            cx = rnd.uniform(-60, W)
+            ui.set_color((cloud[0], cloud[1], cloud[2], rnd.uniform(0.05, 0.16)))
+            ui.Path.oval(cx, cy, cw, rnd.uniform(6, 16)).fill()
+        return ctx.get_image()
+
+
+def tex_disc(kind):
+    S = 256
+    with ui.ImageContext(S, S) as ctx:
+        if kind == 'moon':
+            for i in range(18):
+                t = i / 17.0
+                r = S * 0.5 * (1.0 - t * 0.78)
+                ui.set_color((0.75, 0.82, 1.0, 0.03 + 0.05 * t))
+                ui.Path.oval(S * 0.5 - r, S * 0.5 - r, r * 2, r * 2).fill()
+            ui.set_color((0.95, 0.96, 1.0, 1.0))
+            ui.Path.oval(S * 0.5 - 34, S * 0.5 - 34, 68, 68).fill()
+            ui.set_color((0.78, 0.80, 0.86, 0.6))
+            for x, y, r in ((-10, -8, 10), (8, 6, 7), (-2, 14, 5)):
+                ui.Path.oval(S * 0.5 + x - r, S * 0.5 + y - r, r * 2, r * 2).fill()
+        else:
+            for i in range(24):
+                t = i / 23.0
+                r = S * 0.5 * (1.0 - t * 0.82)
+                ui.set_color((1.0, 0.72 + 0.25 * t, 0.50 + 0.4 * t, 0.05 + 0.10 * t))
+                ui.Path.oval(S * 0.5 - r, S * 0.5 - r, r * 2, r * 2).fill()
+            ui.set_color((1.0, 0.95, 0.85, 1.0))
+            ui.Path.oval(S * 0.5 - 30, S * 0.5 - 30, 60, 60).fill()
+        return ctx.get_image()
+
+
+def tex_fuji():
+    W, H = 1024, 400
+    with ui.ImageContext(W, H) as ctx:
+        def poly(pts, c):
+            p = ui.Path()
+            p.move_to(*pts[0])
+            for q in pts[1:]:
+                p.line_to(*q)
+            p.close()
+            ui.set_color(c)
+            p.fill()
+        poly([(0, H), (W * 0.40, H * 0.14), (W * 0.46, H * 0.05),
+              (W * 0.54, H * 0.05), (W * 0.60, H * 0.14), (W, H)],
+             (0.36, 0.28, 0.44, 1.0))
+        poly([(W * 0.43, H * 0.12), (W * 0.46, H * 0.05), (W * 0.54, H * 0.05),
+              (W * 0.57, H * 0.12), (W * 0.535, H * 0.19), (W * 0.51, H * 0.13),
+              (W * 0.48, H * 0.21), (W * 0.455, H * 0.15)],
+             (0.93, 0.88, 0.92, 1.0))
+        for i in range(10):
+            ui.set_color((0.99, 0.70, 0.52, 0.035))
+            ui.Path.rect(0, H * (0.55 + i * 0.045), W, H).fill()
+        return ctx.get_image()
+
+
+def tex_ground(kind):
+    S = 1024
+    rnd = random.Random(3)
+    with ui.ImageContext(S, S) as ctx:
+        if kind == 'gravel':
+            ui.set_color((0.74, 0.71, 0.66))
+            ui.Path.rect(0, 0, S, S).fill()
+            for _ in range(2600):
+                g = rnd.uniform(0.55, 0.92)
+                ui.set_color((g, g * 0.97, g * 0.92, rnd.uniform(0.25, 0.6)))
+                s = rnd.uniform(1.5, 4.5)
+                ui.Path.oval(rnd.uniform(0, S), rnd.uniform(0, S), s, s).fill()
+            for k in range(0, S, 13):
+                p = ui.Path()
+                p.move_to(0, k)
+                for x in range(0, S + 16, 16):
+                    p.line_to(x, k + math.sin(x * 0.012 + k * 0.05) * 3.0)
+                p.line_width = 2.2
+                ui.set_color((0.45, 0.42, 0.38, 0.30))
+                p.stroke()
+        elif kind == 'moss':
+            ui.set_color((0.17, 0.20, 0.12))
+            ui.Path.rect(0, 0, S, S).fill()
+            for _ in range(1800):
+                g = rnd.uniform(0.6, 1.3)
+                ui.set_color((0.22 * g, 0.26 * g, 0.12 * g, rnd.uniform(0.3, 0.7)))
+                s = rnd.uniform(4, 16)
+                ui.Path.oval(rnd.uniform(0, S), rnd.uniform(0, S), s, s * 0.7).fill()
+            for _ in range(500):      # 落ちた竹の葉
+                x, y, a = rnd.uniform(0, S), rnd.uniform(0, S), rnd.uniform(0, math.pi)
+                p = ui.Path()
+                p.move_to(x, y)
+                p.line_to(x + math.cos(a) * 16, y + math.sin(a) * 16)
+                p.line_width = 2.5
+                ui.set_color((0.45, 0.42, 0.22, 0.6))
+                p.stroke()
+        elif kind == 'snow':
+            ui.set_color((0.88, 0.90, 0.94))
+            ui.Path.rect(0, 0, S, S).fill()
+            for _ in range(900):
+                g = rnd.uniform(0.80, 1.0)
+                ui.set_color((g * 0.95, g * 0.97, g, rnd.uniform(0.2, 0.5)))
+                s = rnd.uniform(10, 40)
+                ui.Path.oval(rnd.uniform(0, S), rnd.uniform(0, S), s, s * 0.6).fill()
+        else:                         # 石畳
+            ui.set_color((0.10, 0.09, 0.09))
+            ui.Path.rect(0, 0, S, S).fill()
+            n = 8
+            c = S / float(n)
+            for i in range(n):
+                for j in range(n):
+                    g = rnd.uniform(0.26, 0.40)
+                    ui.set_color((g, g * 0.95, g * 0.9))
+                    ui.Path.rounded_rect(i * c + 3, j * c + 3, c - 6, c - 6, 6).fill()
+            for _ in range(1400):
+                g = rnd.uniform(0.05, 0.2)
+                ui.set_color((g, g, g, rnd.uniform(0.2, 0.5)))
+                s = rnd.uniform(2, 9)
+                ui.Path.oval(rnd.uniform(0, S), rnd.uniform(0, S), s, s).fill()
+        return ctx.get_image()
+
+
+def tex_dot(rgb, soft):
+    S = 32
+    with ui.ImageContext(S, S) as ctx:
+        n = 8 if soft else 1
+        for i in range(n):
+            t = i / float(max(1, n - 1))
+            r = S * 0.5 * (1.0 - t * 0.7) if soft else S * 0.42
+            ui.set_color((rgb[0], rgb[1], rgb[2], 0.18 + 0.5 * t if soft else 1.0))
+            ui.Path.oval(S * 0.5 - r, S * 0.5 - r, r * 2, r * 2).fill()
+        return ctx.get_image()
+
+
+def tex_petal():
+    with ui.ImageContext(32, 32) as ctx:
+        ui.set_color((1.0, 0.80, 0.86, 1.0))
+        ui.Path.oval(4, 9, 24, 14).fill()
+        ui.set_color((1.0, 0.92, 0.95, 0.9))
+        ui.Path.oval(9, 12, 12, 6).fill()
+        return ctx.get_image()
+
+
+def tex_splat(seed):
+    """血しぶき:中心の溜まり+一方向へ飛ぶ滴"""
+    S = 128
+    rnd = random.Random(seed)
+    with ui.ImageContext(S, S) as ctx:
+        base = (0.40, 0.012, 0.018)
+        for i in range(8):
+            r = rnd.uniform(9, 20)
+            cx = S * 0.5 + rnd.uniform(-14, 14)
+            cy = S * 0.5 + rnd.uniform(-10, 10)
+            ui.set_color((base[0], base[1], base[2], 0.9))
+            ui.Path.oval(cx - r, cy - r * 0.8, r * 2, r * 1.6).fill()
+        ang = rnd.uniform(0, math.pi * 2)
+        for i in range(18):
+            d = rnd.uniform(18, 60)
+            a = ang + rnd.gauss(0, 0.35)
+            r = rnd.uniform(1.2, 5.0) * (1.0 - d / 75.0)
+            x = S * 0.5 + math.cos(a) * d
+            y = S * 0.5 + math.sin(a) * d
+            ui.set_color((base[0] * 1.1, base[1], base[2], 0.95))
+            ui.Path.oval(x - r, y - r, r * 2, r * 2).fill()
+        for i in range(4):
+            r = rnd.uniform(4, 9)
+            ui.set_color((0.22, 0.0, 0.01, 0.55))
+            ui.Path.oval(S * 0.5 - r + rnd.uniform(-8, 8),
+                         S * 0.5 - r + rnd.uniform(-6, 6), r * 2, r * 2).fill()
+        return ctx.get_image()
+
+
+class Renderer(object):
+    def __init__(self, w, h, stage):
+        self.scene = SCNScene.scene()
+        self.root = self.scene.rootNode()
+        v = SCNView.alloc().initWithFrame_options_(
+            CGRect(CGPoint(0, 0), CGSize(w, h)), None)
+        v.setScene_(self.scene)
+        v.setAntialiasingMode_(2 if QUALITY >= 2 else (1 if QUALITY else 0))
+        v.setPreferredFramesPerSecond_(60)
+        v.setRendersContinuously_(True)
+        v.setPlaying_(True)
+        v.setUserInteractionEnabled_(False)
+        v.setAutoresizingMask_(18)
+        self.view = v
+        self.mats = {}
+        self.geos = {}
+        self.fdata = {}
+        self.bursts = []
+        self.gnodes = {}
+        self.gen = -1
+        self.world_id = None
+        self.mesh_ok = True
+        self.env = None
+        self.stage_key = None
+        self.fire_lights = []
+        self.fov = None
+        self.head_hidden = False
+        self.build_camera()
+        self.build_effects()
+        self.splats = [self.mat('splat%d' % k, rough=0.22, img=tex_splat(k + 1),
+                                depth=False) for k in range(4)]
+        self.build_stage(stage)
+        v.setPointOfView_(self.cam_node)
+
+    # ---------- 材質・ノード ----------
+    def mat(self, key, rgb=(1, 1, 1), rough=0.8, metal=0.0, emit=None,
+            const=False, img=None, depth=True):
+        if key in self.mats:
+            return self.mats[key]
+        m = SCNMaterial.material()
+        m.setLightingModelName_('constant' if const else 'physicallyBased')
+        m.diffuse().setContents_(ObjCInstance(img) if img is not None else color(rgb))
+        if not const:
+            m.roughness().setContents_(ns(rough))
+            m.metalness().setContents_(ns(metal))
+        if emit is not None:
+            m.emission().setContents_(color(emit))
+        if not depth:
+            opt(m.setWritesToDepthBuffer_, False)
+        self.mats[key] = m
+        return m
+
+    def node(self, geo, m, parent=None, pos=None):
+        if m is not None:
+            geo.setFirstMaterial_(m)
+        n = SCNNode.nodeWithGeometry_(geo)
+        if pos is not None:
+            set_pos(n, pos)
+        (parent or self.root).addChildNode_(n)
+        return n
+
+    def en(self, geo, m, pos=None):
+        return self.node(geo, m, parent=self.env, pos=pos)
+
+    def mesh_node(self, key, build, mats, parent=None, pos=None):
+        """独自メッシュのノード(同形状はキャッシュして共有)"""
+        g = self.geos.get(key)
+        if g is None:
+            v, groups = build()
+            g = make_geometry(v, groups)
+            g.setMaterials_(mats)
+            self.geos[key] = g
+        n = SCNNode.nodeWithGeometry_(g)
+        if pos is not None:
+            set_pos(n, pos)
+        (parent or self.root).addChildNode_(n)
+        return n
+
+    def mesh_fail(self, e):
+        if self.mesh_ok:
+            MESH_ERR.append('mesh: %r' % (e,))
+        self.mesh_ok = False
+
+    # ---------- カメラ ----------
+    def build_camera(self):
+        cam = SCNCamera.camera()
+        opt(cam.setProjectionDirection_, 0)
+        cam.setZNear_(0.03)
+        cam.setZFar_(260.0)
+        if QUALITY >= 1:
+            opt(cam.setWantsHDR_, True)
+            opt(cam.setWantsExposureAdaptation_, False)
+            opt(cam.setBloomIntensity_, 0.45)
+            opt(cam.setBloomThreshold_, 0.85)
+            opt(cam.setBloomBlurRadius_, 6.0)
+            opt(cam.setVignettingIntensity_, 0.55)
+            opt(cam.setVignettingPower_, 1.1)
+        if QUALITY >= 2:
+            opt(cam.setScreenSpaceAmbientOcclusionIntensity_, 0.7)
+            opt(cam.setScreenSpaceAmbientOcclusionRadius_, 0.25)
+            opt(cam.setMotionBlurIntensity_, 0.25)
+        self.cam = cam
+        self.cam_node = SCNNode.node()
+        self.cam_node.setCamera_(cam)
+        self.root.addChildNode_(self.cam_node)
+
+    def dir_light(self, rgb, inten, direction, shadow):
+        l = SCNLight.light()
+        l.setType_('directional')
+        l.setColor_(color(rgb))
+        l.setIntensity_(inten)
+        if shadow and QUALITY >= 1:
+            l.setCastsShadow_(True)
+            opt(l.setShadowMode_, 0)
+            opt(l.setShadowSampleCount_, 8 if QUALITY >= 2 else 2)
+            opt(l.setShadowRadius_, 3.0)
+            opt(l.setShadowColor_, color((0.08, 0.05, 0.10), 0.72))
+            opt(l.setOrthographicScale_, 7.0)
+            opt(l.setAutomaticallyAdjustsShadowProjection_, True)
+            opt(l.setMaximumShadowDistance_, 20.0)
+        n = SCNNode.node()
+        n.setLight_(l)
+        Z = mul(norm(direction), -1.0)
+        X = norm(cross(UP, Z))
+        set_rot(n, quat_from_basis(X, cross(Z, X), Z))
+        self.env.addChildNode_(n)
+
+    # ---------- ステージ ----------
+    def build_stage(self, st):
+        if self.env is not None:
+            self.env.removeFromParentNode()
+        self.env = SCNNode.node()
+        self.root.addChildNode_(self.env)
+        self.fire_lights = []
+        self.stage_key = st['key']
+        k = st['key']
+
+        sky = tex_sky(st['sky'], st['cloud'])
+        m = self.mat('sky_' + k, const=True, img=sky)
+        opt(m.setCullMode_, 1)
+        g = SCNSphere.sphereWithRadius_(110.0)
+        opt(g.setSegmentCount_, 48)
+        self.en(g, m)
+        env = self.scene.lightingEnvironment()
+        env.setContents_(ObjCInstance(sky))
+        opt(env.setIntensity_, 1.3)
+        self.scene.setFogStartDistance_(st['fog_d'][0])
+        self.scene.setFogEndDistance_(st['fog_d'][1])
+        self.scene.setFogColor_(color(st['fog']))
+        self.view.setBackgroundColor_(color(st['fog']))
+
+        sun = st['sun']
+        self.dir_light(sun[0], sun[1], sun[2], True)
+        fd = norm((0.7, -0.3, -0.5))
+        self.dir_light(st['fill'][0], st['fill'][1], fd, False)
+        amb = SCNLight.light()
+        amb.setType_('ambient')
+        amb.setColor_(color(st['amb'][0]))
+        amb.setIntensity_(st['amb'][1])
+        n = SCNNode.node()
+        n.setLight_(amb)
+        self.env.addChildNode_(n)
+
+        fl = SCNPlane.planeWithWidth_height_(44.0, 44.0)
+        n = self.en(fl, self.mat('ground_' + st['ground'], rough=0.97,
+                                 img=tex_ground(st['ground'])))
+        set_euler(n, -math.pi * 0.5, 0.0, 0.0)
+        ring = SCNTorus.torusWithRingRadius_pipeRadius_(ARENA_R + 0.15, 0.045)
+        self.en(ring, self.mat('rope', (0.78, 0.68, 0.45), 0.9), pos=(0, 0.04, 0))
+
+        if st['disc']:
+            sd = norm(mul(st['sun'][2], -1.0))
+            dm = self.mat('disc_' + st['disc'], const=True, img=tex_disc(st['disc']))
+            opt(dm.setBlendMode_, 1)
+            opt(dm.setWritesToDepthBuffer_, False)
+            size = 34.0 if st['disc'] == 'sun' else 22.0
+            n = self.en(SCNPlane.planeWithWidth_height_(size, size), dm,
+                        pos=(sd[0] * 90.0, max(12.0, sd[1] * 90.0), sd[2] * 90.0))
+            n.setConstraints_([SCNBillboardConstraint.billboardConstraint()])
+
+        mm = self.mat('mtn_' + k, st['mtn'], 1.0)
+        for x, z, r, h in ((60, -70, 34, 24), (-40, -85, 40, 20),
+                           (-75, 20, 30, 18), (30, 80, 36, 22)):
+            self.en(SCNCone.coneWithTopRadius_bottomRadius_height_(0, r, h), mm,
+                    pos=(x, h * 0.5 - 1.0, z))
+
+        getattr(self, 'scene_' + st['scenery'])()
+        self.particles(st['particles'])
+
+    def box(self, w, h, l, m, pos, ch=0.02):
+        return self.en(SCNBox.boxWithWidth_height_length_chamferRadius_(w, h, l, ch), m, pos)
+
+    def lanterns(self, cap=None):
+        stone = self.mat('stone', (0.50, 0.49, 0.47), 0.95)
+        glow = self.mat('lamp', (1.0, 0.75, 0.4), 0.6, emit=(1.0, 0.62, 0.25))
+        for x, z in ((6.4, 6.4), (6.4, -6.4), (-6.4, 6.4), (-6.4, -6.4)):
+            self.box(0.6, 0.25, 0.6, stone, (x, 0.12, z))
+            self.en(SCNCylinder.cylinderWithRadius_height_(0.12, 0.9), stone, (x, 0.7, z))
+            self.box(0.42, 0.34, 0.42, glow, (x, 1.32, z))
+            self.en(SCNPyramid.pyramidWithWidth_height_length_(0.8, 0.35, 0.8), stone,
+                    (x, 1.49, z))
+            if cap is not None:
+                self.en(SCNPyramid.pyramidWithWidth_height_length_(0.74, 0.3, 0.74), cap,
+                        (x, 1.53, z))
+
+    def scene_temple(self):
+        fm = self.mat('fuji', const=True, img=tex_fuji())
+        opt(fm.setWritesToDepthBuffer_, False)
+        n = self.en(SCNPlane.planeWithWidth_height_(150.0, 58.0), fm, (88.0, 22.0, 30.0))
+        bc = SCNBillboardConstraint.billboardConstraint()
+        opt(bc.setFreeAxes_, 2)
+        n.setConstraints_([bc])
+        red = self.mat('torii', (0.70, 0.12, 0.08), 0.55)
+        blk = self.mat('toriik', (0.08, 0.07, 0.07), 0.6)
+        tx, tz = 11.0, -1.5
+        for dz in (-2.3, 2.3):
+            self.en(SCNCylinder.cylinderWithRadius_height_(0.2, 4.6), red, (tx, 2.3, tz + dz))
+        self.box(0.5, 0.36, 6.8, blk, (tx, 4.75, tz), 0.04)
+        self.box(0.42, 0.3, 6.2, red, (tx, 4.42, tz), 0.03)
+        self.box(0.3, 0.26, 5.4, red, (tx, 3.7, tz))
+        wood = self.mat('wood', (0.24, 0.14, 0.09), 0.8)
+        roof = self.mat('roof', (0.13, 0.12, 0.14), 0.7)
+        self.box(7.0, 3.6, 11.0, wood, (-14.0, 1.8, 3.0), 0.05)
+        self.en(SCNPyramid.pyramidWithWidth_height_length_(10.0, 3.2, 14.0), roof,
+                (-14.0, 3.6, 3.0))
+        self.lanterns()
+        bark = self.mat('bark', (0.20, 0.13, 0.11), 0.9)
+        pink = self.mat('sakura', (0.98, 0.70, 0.79), 1.0, emit=(0.16, 0.05, 0.08))
+        rnd = random.Random(11)
+        for x, z in ((8.5, 7.8), (-8.0, -8.5), (9.5, -9.0), (-10.5, 8.0), (15, 3)):
+            self.en(SCNCylinder.cylinderWithRadius_height_(0.2, 2.8), bark, (x, 1.4, z))
+            for _ in range(7):
+                self.en(SCNSphere.sphereWithRadius_(rnd.uniform(0.9, 1.5)), pink,
+                        (x + rnd.uniform(-1.4, 1.4), 3.1 + rnd.uniform(-0.3, 1.2),
+                         z + rnd.uniform(-1.4, 1.4)))
+        pine = self.mat('pine', (0.10, 0.19, 0.14), 0.95)
+        for x, z in ((-16, -10), (-18, 14), (20, -14), (18, 14), (0, -18), (-4, 19)):
+            self.en(SCNCylinder.cylinderWithRadius_height_(0.25, 3.0), bark, (x, 1.5, z))
+            for k in range(3):
+                self.en(SCNCone.coneWithTopRadius_bottomRadius_height_(0, 2.2 - k * 0.5, 2.0),
+                        pine, (x, 3.0 + k * 1.1, z))
+
+    def scene_bamboo(self):
+        green = self.mat('bamboo', (0.40, 0.55, 0.28), 0.55)
+        dark = self.mat('bamboo2', (0.28, 0.40, 0.20), 0.6)
+        leaf = self.mat('bleaf', (0.14, 0.26, 0.11), 0.9)
+        rnd = random.Random(21)
+        for i in range(110):
+            a = rnd.uniform(0, math.pi * 2)
+            r = rnd.uniform(6.8, 19.0)
+            x, z = math.cos(a) * r, math.sin(a) * r
+            h = rnd.uniform(6.0, 11.0)
+            n = self.en(SCNCylinder.cylinderWithRadius_height_(rnd.uniform(0.04, 0.075), h),
+                        green if i % 3 else dark, (x, h * 0.5, z))
+            set_euler(n, rnd.uniform(-0.06, 0.06), 0, rnd.uniform(-0.06, 0.06))
+            if i % 2 == 0:
+                c = self.en(SCNSphere.sphereWithRadius_(rnd.uniform(0.8, 1.4)), leaf,
+                            (x, h - 0.4, z))
+                set_scale(c, 1.0, 0.45, 1.0)
+        glow = self.mat('andon', (1.0, 0.85, 0.55), 0.8, emit=(1.0, 0.70, 0.35))
+        wood = self.mat('wood', (0.24, 0.14, 0.09), 0.8)
+        for a in (0.6, 2.4, 4.1):
+            x, z = math.cos(a) * 5.9, math.sin(a) * 5.9
+            self.box(0.05, 0.9, 0.05, wood, (x, 0.45, z))
+            self.box(0.32, 0.45, 0.32, glow, (x, 1.1, z))
+            l = SCNLight.light()
+            l.setType_('omni')
+            l.setColor_(color((1.0, 0.72, 0.4)))
+            l.setIntensity_(260.0)
+            opt(l.setAttenuationStartDistance_, 0.5)
+            opt(l.setAttenuationEndDistance_, 7.0)
+            ln = SCNNode.node()
+            ln.setLight_(l)
+            set_pos(ln, (x, 1.2, z))
+            self.env.addChildNode_(ln)
+
+    def scene_castle(self):
+        stone = self.mat('cstone', (0.45, 0.44, 0.43), 0.95)
+        plaster = self.mat('plaster', (0.90, 0.90, 0.88), 0.85)
+        roof = self.mat('croof', (0.20, 0.22, 0.26), 0.6)
+        snow = self.mat('snowcap', (0.95, 0.96, 0.98), 0.7)
+        for a in (0.0, math.pi * 0.5, math.pi, math.pi * 1.5):
+            c, s = math.cos(a), math.sin(a)
+            x, z = c * 13.0, s * 13.0
+            w, l = (1.2, 26.0) if abs(c) > 0.5 else (26.0, 1.2)
+            self.box(w, 1.6, l, stone, (x, 0.8, z))
+            self.box(w * 0.7, 1.2, l * 0.98 if l > w else l * 0.7, plaster, (x, 2.2, z))
+            self.box(w * 1.1, 0.3, l * 1.02 if l > w else l * 1.1, roof, (x, 2.95, z))
+            self.box(w * 1.0, 0.08, l * 1.0 if l > w else l * 1.0, snow, (x, 3.14, z))
+        tx, tz = -20.0, -8.0
+        self.box(9.0, 4.0, 9.0, stone, (tx, 2.0, tz), 0.1)
+        y = 4.0
+        for w, h in ((7.0, 3.0), (5.2, 2.6), (3.6, 2.2)):
+            self.box(w, h, w, plaster, (tx, y + h * 0.5, tz))
+            y += h
+            self.en(SCNPyramid.pyramidWithWidth_height_length_(w + 2.0, 1.4, w + 2.0),
+                    roof, (tx, y, tz))
+            self.en(SCNPyramid.pyramidWithWidth_height_length_(w + 1.8, 1.3, w + 1.8),
+                    snow, (tx, y + 0.12, tz))
+            y += 1.0
+        pine = self.mat('pine', (0.10, 0.19, 0.14), 0.95)
+        bark = self.mat('bark', (0.20, 0.13, 0.11), 0.9)
+        for x, z in ((8, 8), (-8, 9), (9, -8), (-9, -9)):
+            self.en(SCNCylinder.cylinderWithRadius_height_(0.22, 2.4), bark, (x, 1.2, z))
+            for k in range(3):
+                self.en(SCNCone.coneWithTopRadius_bottomRadius_height_(0, 1.9 - k * 0.45, 1.8),
+                        pine, (x, 2.6 + k, z))
+                self.en(SCNCone.coneWithTopRadius_bottomRadius_height_(0, 1.5 - k * 0.4, 0.6),
+                        snow, (x, 3.2 + k, z))
+        self.lanterns(cap=snow)
+
+    def scene_fire(self):
+        char = self.mat('char', (0.06, 0.05, 0.05), 0.9)
+        flame = self.mat('flame', (1.0, 0.45, 0.1), 0.5, emit=(1.0, 0.38, 0.08))
+        cloth = self.mat('nobori', (0.60, 0.05, 0.04), 0.9)
+        pole = self.mat('pole', (0.12, 0.09, 0.07), 0.8)
+        tx, tz = 18.0, -5.0
+        self.box(9.0, 4.0, 9.0, char, (tx, 2.0, tz), 0.1)
+        y = 4.0
+        for w, h in ((7.0, 3.0), (5.2, 2.6), (3.6, 2.2)):
+            self.box(w, h, w, char, (tx, y + h * 0.5, tz))
+            y += h
+            self.en(SCNPyramid.pyramidWithWidth_height_length_(w + 2.0, 1.4, w + 2.0),
+                    char, (tx, y, tz))
+            y += 1.0
+        rnd = random.Random(5)
+        spots = [(tx + rnd.uniform(-3, 3), rnd.uniform(3, 11), tz + rnd.uniform(-3, 3))
+                 for _ in range(9)]
+        for x, z in ((-12, 10), (-14, -9), (10, 13)):
+            self.box(6.0, 3.0, 5.0, char, (x, 1.5, z))
+            self.en(SCNPyramid.pyramidWithWidth_height_length_(7.5, 1.8, 6.5), char,
+                    (x, 3.0, z))
+            spots.append((x, 3.5, z))
+        for x, y, z in spots:
+            self.en(SCNCone.coneWithTopRadius_bottomRadius_height_(0, rnd.uniform(0.5, 1.2),
+                                                                   rnd.uniform(1.2, 2.6)),
+                    flame, (x, y, z))
+        for x, y, z in spots[::3]:
+            l = SCNLight.light()
+            l.setType_('omni')
+            l.setColor_(color((1.0, 0.50, 0.18)))
+            l.setIntensity_(1600.0)
+            opt(l.setAttenuationStartDistance_, 2.0)
+            opt(l.setAttenuationEndDistance_, 26.0)
+            ln = SCNNode.node()
+            ln.setLight_(l)
+            set_pos(ln, (x, y + 1.0, z))
+            self.env.addChildNode_(ln)
+            self.fire_lights.append((l, 1600.0))
+        for a in range(8):
+            ang = a * math.pi / 4 + 0.3
+            x, z = math.cos(ang) * 6.4, math.sin(ang) * 6.4
+            self.box(0.06, 3.2, 0.06, pole, (x, 1.6, z))
+            self.box(0.02, 1.6, 0.5, cloth, (x, 2.2, z + 0.26))
+
+    def particles(self, kind):
+        ps = SCNParticleSystem.particleSystem()
+        ps.setLoops_(True)
+        opt(ps.setLightingEnabled_, False)
+        opt(ps.setWarmupDuration_, 8.0)
+        q = 1.0 if QUALITY else 0.4
+        if kind == 'petal':
+            ps.setBirthRate_(26.0 * q)
+            ps.setParticleLifeSpan_(8.0)
+            ps.setParticleSize_(0.035)
+            ps.setParticleSizeVariation_(0.015)
+            ps.setParticleImage_(ObjCInstance(tex_petal()))
+            ps.setParticleColor_(color((1.0, 0.85, 0.90)))
+            ps.setParticleVelocity_(0.15)
+            ps.setParticleAngleVariation_(180.0)
+            ps.setParticleAngularVelocity_(80.0)
+            ps.setParticleAngularVelocityVariation_(120.0)
+            ps.setAcceleration_(V3(0.25, -0.32, 0.12), restype=None, argtypes=[V3])
+            ps.setBlendMode_(4)
+            shape, y = (16, 0.2, 16), 5.5
+        elif kind == 'firefly':
+            ps.setBirthRate_(7.0 * q)
+            ps.setParticleLifeSpan_(6.0)
+            ps.setParticleSize_(0.022)
+            ps.setParticleImage_(ObjCInstance(tex_dot((0.8, 1.0, 0.45), True)))
+            ps.setParticleColor_(color((0.75, 1.0, 0.40)))
+            ps.setParticleVelocity_(0.15)
+            ps.setParticleVelocityVariation_(0.15)
+            ps.setSpreadingAngle_(180.0)
+            ps.setAcceleration_(V3(0.0, 0.02, 0.0), restype=None, argtypes=[V3])
+            ps.setBlendMode_(0)
+            shape, y = (14, 2.0, 14), 1.3
+        elif kind == 'snow':
+            ps.setBirthRate_(170.0 * q)
+            ps.setParticleLifeSpan_(7.0)
+            ps.setParticleSize_(0.02)
+            ps.setParticleSizeVariation_(0.01)
+            ps.setParticleImage_(ObjCInstance(tex_dot((1.0, 1.0, 1.0), True)))
+            ps.setParticleColor_(color((1.0, 1.0, 1.0)))
+            ps.setParticleVelocity_(0.2)
+            ps.setAcceleration_(V3(0.12, -0.55, 0.05), restype=None, argtypes=[V3])
+            ps.setBlendMode_(4)
+            shape, y = (20, 0.2, 20), 7.0
+        else:
+            ps.setBirthRate_(60.0 * q)
+            ps.setParticleLifeSpan_(4.0)
+            ps.setParticleSize_(0.018)
+            ps.setParticleImage_(ObjCInstance(tex_dot((1.0, 0.6, 0.2), True)))
+            ps.setParticleColor_(color((1.0, 0.55, 0.18)))
+            ps.setParticleVelocity_(0.4)
+            ps.setAcceleration_(V3(0.15, 0.6, 0.05), restype=None, argtypes=[V3])
+            ps.setBlendMode_(0)
+            shape, y = (16, 0.2, 16), 0.2
+        ps.setEmitterShape_(SCNBox.boxWithWidth_height_length_chamferRadius_(
+            shape[0], shape[1], shape[2], 0))
+        n = SCNNode.node()
+        set_pos(n, (0.0, y, 0.0))
+        n.addParticleSystem_(ps)
+        self.env.addChildNode_(n)
+
+    def build_effects(self):
+        spark = ObjCInstance(tex_dot((1.0, 0.95, 0.8), True))
+        drop = ObjCInstance(tex_dot((1.0, 1.0, 1.0), False))
+        self.ps = {}
+        for kind in ('spark', 'hit', 'cut'):
+            p = SCNParticleSystem.particleSystem()
+            p.setLoops_(False)
+            p.setEmissionDuration_(0.05)
+            if kind == 'spark':
+                p.setBirthRate_(900.0)
+                p.setParticleLifeSpan_(0.28)
+                p.setParticleLifeSpanVariation_(0.12)
+                p.setParticleVelocity_(4.5)
+                p.setParticleVelocityVariation_(2.5)
+                p.setSpreadingAngle_(180.0)
+                p.setParticleSize_(0.010)
+                p.setParticleImage_(spark)
+                p.setParticleColor_(color((1.0, 0.82, 0.45)))
+                p.setBlendMode_(0)
+                p.setAcceleration_(V3(0, -7.0, 0), restype=None, argtypes=[V3])
+            else:
+                red = BLOOD
+                p.setBirthRate_(900.0 if kind == 'cut' else 380.0)
+                p.setEmissionDuration_(0.09 if kind == 'cut' else 0.05)
+                p.setParticleLifeSpan_(0.8)
+                p.setParticleLifeSpanVariation_(0.3)
+                p.setParticleVelocity_(2.8 if kind == 'cut' else 1.8)
+                p.setParticleVelocityVariation_(1.4)
+                p.setSpreadingAngle_(50.0)
+                p.setParticleSize_(0.012)
+                p.setParticleSizeVariation_(0.007)
+                p.setParticleImage_(drop if red else spark)
+                p.setParticleColor_(color((0.45, 0.02, 0.03)) if red
+                                    else color((1.0, 0.95, 0.9)))
+                p.setBlendMode_(4 if red else 0)
+                p.setAcceleration_(V3(0, -9.8, 0), restype=None, argtypes=[V3])
+            opt(p.setLightingEnabled_, False)
+            self.ps[kind] = p
+
+    def burst(self, kind, pos, direction):
+        p = self.ps[kind].copy()
+        if direction is not None:
+            p.setEmittingDirection_(V3(direction[0], direction[1], direction[2]),
+                                    restype=None, argtypes=[V3])
+        n = SCNNode.node()
+        set_pos(n, pos)
+        n.addParticleSystem_(p)
+        self.root.addChildNode_(n)
+        self.bursts.append((n, time.time() + 2.0))
+
+    # ---------- 人体 ----------
+    def fmat(self, f, key):
+        pal = f.pal
+        if key == 'skin':
+            return self.mat('skin', (0.80, 0.60, 0.48), 0.52)
+        if key == 'tabi':
+            return self.mat('tabi', (0.88, 0.87, 0.84), 0.9)
+        if key == 'collar':
+            return self.mat('collar', (0.90, 0.89, 0.85), 0.9)
+        return self.mat(pal['name'] + key, pal[key], 0.92)
+
+    def cut_mats(self):
+        if BLOOD:
+            fl = self.mat('flesh', (0.50, 0.05, 0.06), 0.35, emit=(0.06, 0.0, 0.0))
+        else:
+            fl = self.mat('fleshw', (0.80, 0.76, 0.72), 0.6)
+        return fl, self.mat('bone', (0.92, 0.88, 0.80), 0.55)
+
+    def seg_node(self, f, seg):
+        if seg.mat is None:
+            return None
+        m = self.fmat(f, seg.mat)
+        fl, bn = self.cut_mats()
+        if self.mesh_ok:
+            try:
+                key = (f.pal['name'], seg.prof, seg.mat, round(seg.L0, 4),
+                       round(seg.u0, 4), round(seg.u1, 4), seg.cap0, seg.cap1)
+                keys = PROFILES[seg.prof]
+                n = self.mesh_node(key, lambda: loft(keys, seg.L0, seg.u0, seg.u1,
+                                                     seg.ys, seg.cap0, seg.cap1),
+                                   [m, fl, bn])
+                for pname, mk in EXTRAS.get(seg.prof, ()):
+                    a, b = prof_range(pname)
+                    if a >= seg.u0 - 1e-6 and b <= seg.u1 + 1e-6:
+                        pk = PROFILES[pname]
+                        self.mesh_node(('x', f.pal['name'], pname, round(seg.L0, 4)),
+                                       lambda: loft(pk, seg.L0, a, b, seg.ys,
+                                                    'round', 'round', grow=0.004),
+                                       [self.fmat(f, mk)], parent=n)
+                if seg.prof == 'foot':
+                    zori = self.mat('zori', (0.72, 0.60, 0.40), 0.95)
+                    self.node(SCNBox.boxWithWidth_height_length_chamferRadius_(
+                        0.095, 0.25, 0.014, 0.006), zori, parent=n,
+                        pos=(0, -0.03 - seg.ys, 0.052))
+                return n
+            except Exception as e:
+                self.mesh_fail(e)
+        L = max(seg.L0 * (seg.u1 - seg.u0) * 0.8, 0.02)
+        return self.node(SCNCapsule.capsuleWithCapRadius_height_(seg.r, L + 2 * seg.r), m)
+
+    def build_fighter(self, f):
+        d = {'cache': {}}
+        skin = self.fmat(f, 'skin')
+        hair = self.mat('hair', (0.025, 0.022, 0.024), 0.45)
+        d['hands'] = {}
+        for h in (HAND_L, HAND_R):
+            n = None
+            if self.mesh_ok:
+                try:
+                    n = self.mesh_node('hand', lambda: loft(PROFILES['hand'], 0.10, -0.15,
+                                                            1.0, 0.0, 'round', 'round'),
+                                       [skin])
+                    self.node(SCNCapsule.capsuleWithCapRadius_height_(0.014, 0.06), skin,
+                              parent=n, pos=(0.028 if h == HAND_R else -0.028, 0.01, -0.02))
+                except Exception as e:
+                    self.mesh_fail(e)
+                    n = None
+            if n is None:
+                n = self.node(SCNSphere.sphereWithRadius_(0.046), skin)
+            d['hands'][h] = {'node': n}
+        # 頭(ローカル: Y 上, X 右, -Z 顔の向き)
+        hn = SCNNode.node()
+        self.root.addChildNode_(hn)
+        made = False
+        if self.mesh_ok:
+            try:
+                self.mesh_node('head', lambda: (lambda v, t: (v, [t]))(*head_mesh()),
+                               [skin], parent=hn)
+                self.mesh_node('hair', lambda: (lambda v, t: (v, [t]))(*hair_mesh()),
+                               [hair], parent=hn)
+                made = True
+            except Exception as e:
+                self.mesh_fail(e)
+        if not made:
+            self.node(SCNSphere.sphereWithRadius_(0.105), skin, parent=hn)
+        for sx in (-1, 1):
+            e = self.node(SCNSphere.sphereWithRadius_(0.028), skin, parent=hn,
+                          pos=(0.079 * sx, -0.004, 0.012))
+            set_scale(e, 0.36, 1.0, 0.68)
+            de = norm((0.36 * sx, 0.14, -0.92))
+            c = sub(head_point(de), mul(de, 0.0075))
+            self.node(SCNSphere.sphereWithRadius_(0.0118),
+                      self.mat('eyew', (0.86, 0.84, 0.80), 0.25), parent=hn, pos=c)
+            self.node(SCNSphere.sphereWithRadius_(0.0058),
+                      self.mat('iris', (0.10, 0.06, 0.04), 0.15), parent=hn,
+                      pos=add(c, mul(de, 0.0092)))
+        mage = self.node(SCNCapsule.capsuleWithCapRadius_height_(0.018, 0.11), hair,
+                         parent=hn, pos=(0, 0.118, 0.03))
+        set_euler(mage, math.pi * 0.5 - 0.3, 0, 0)
+        band = self.node(SCNTorus.torusWithRingRadius_pipeRadius_(0.0835, 0.0105),
+                         self.fmat(f, 'band'), parent=hn, pos=(0, 0.056, 0.004))
+        set_scale(band, 1.0, 1.0, 1.2)
+        d['head'] = {'node': hn, 'mrk': 0, 'hidden': False}
+        # 刀(ローカル: Y 刀身, X 刃の向き)
+        s = SCNNode.node()
+        self.root.addChildNode_(s)
+        steel = self.mat('steel', (0.93, 0.94, 0.96), 0.14, metal=1.0)
+        iron = self.mat('iron', (0.18, 0.16, 0.14), 0.45, metal=0.8)
+        gold = self.mat('habaki', (0.85, 0.66, 0.30), 0.3, metal=1.0)
+        wrap = self.mat('tsuka', (0.07, 0.07, 0.09), 0.8)
+        made = False
+        if self.mesh_ok:
+            try:
+                self.mesh_node('blade', lambda: (lambda v, t: (v, [t]))(*blade_mesh()),
+                               [steel], parent=s)
+                made = True
+            except Exception as e:
+                self.mesh_fail(e)
+        if not made:
+            self.node(SCNBox.boxWithWidth_height_length_chamferRadius_(
+                0.030, BLADE, 0.007, 0.002), steel, parent=s, pos=(0.0, BLADE * 0.5, 0))
+        self.node(SCNBox.boxWithWidth_height_length_chamferRadius_(0.036, 0.035, 0.012, 0.003),
+                  gold, parent=s, pos=(0.0, 0.02, 0))
+        self.node(SCNCylinder.cylinderWithRadius_height_(0.042, 0.008), iron, parent=s)
+        self.node(SCNCapsule.capsuleWithCapRadius_height_(0.017, 0.27), wrap,
+                  parent=s, pos=(0, -0.135, 0))
+        d['sword'] = {'node': s, 'mrk': 0}
+        self.fdata[f] = d
+        for seg in f.segs:
+            seg.node = self.seg_node(f, seg)
+            seg.mrk_n = 0
+
+    def drop_fighter(self, f):
+        d = self.fdata.pop(f, None)
+        if d:
+            for h in d['hands'].values():
+                h['node'].removeFromParentNode()
+            d['head']['node'].removeFromParentNode()
+            d['sword']['node'].removeFromParentNode()
+        for seg in f.segs:
+            if seg.node is not None:
+                seg.node.removeFromParentNode()
+                seg.node = None
+
+    # ---------- 血痕 ----------
+    def decal(self, parent, pos, nrm, size, var, stretch=1.0):
+        g = SCNPlane.planeWithWidth_height_(size, size * stretch)
+        n = self.node(g, self.splats[var % 4], parent=parent, pos=pos)
+        Zd = norm(nrm)
+        Xd = cross((0.0, 1.0, 0.0), Zd)
+        if length(Xd) < 1e-3:
+            Xd = (1.0, 0.0, 0.0)
+        Xd = norm(Xd)
+        set_rot(n, quat_from_basis(Xd, cross(Zd, Xd), Zd))
+        return n
+
+    def sync_ground(self, world):
+        live = set()
+        for gid, x, z, size, ang, var in world.ground:
+            live.add(gid)
+            if gid in self.gnodes:
+                continue
+            g = SCNPlane.planeWithWidth_height_(size, size)
+            n = self.node(g, self.splats[var], pos=(x, 0.003 + (gid % 7) * 0.0004, z))
+            c, s = math.cos(ang), math.sin(ang)
+            set_rot(n, quat_from_basis((c, 0.0, s), (s, 0.0, -c), (0.0, 1.0, 0.0)))
+            self.gnodes[gid] = n
+        for gid in list(self.gnodes):
+            if gid not in live:
+                self.gnodes.pop(gid).removeFromParentNode()
+
+    # ---------- 毎フレーム ----------
+    def moved(self, cache, key, p, q):
+        old = cache.get(key)
+        if old is not None:
+            if (abs(old[0] - p[0]) + abs(old[1] - p[1]) + abs(old[2] - p[2]) < 2e-4 and
+                    abs(old[3] - q[0]) + abs(old[4] - q[1]) + abs(old[5] - q[2]) +
+                    abs(old[6] - q[3]) < 2e-4):
+                return False
+        cache[key] = (p[0], p[1], p[2], q[0], q[1], q[2], q[3])
+        return True
+
+    def sync(self, world, cam):
+        if world.gen != self.gen or id(world) != self.world_id:
+            for f in list(self.fdata):
+                self.drop_fighter(f)
+            for n, _ in self.bursts:
+                n.removeFromParentNode()
+            self.bursts = []
+            self.build_fighter(world.player)
+            self.build_fighter(world.cpu)
+            self.gen = world.gen
+            self.world_id = id(world)
+        if cam.fov != self.fov:
+            opt(self.cam.setFieldOfView_, cam.fov)
+            self.fov = cam.fov
+
+        SCNTransaction.begin()
+        opt(SCNTransaction.setDisableActions_, True)
+        hide = cam.fps_active(world)
+        for f in (world.player, world.cpu):
+            self.sync_fighter(f, hide and f is world.player)
+        set_pos(self.cam_node, cam.eye())
+        set_rot(self.cam_node, cam.quat())
+        for kind, pos, d in world.fx:
+            self.burst(kind, pos, d)
+        world.fx = []
+        self.sync_ground(world)
+        for l, base in self.fire_lights:
+            l.setIntensity_(base * random.uniform(0.75, 1.2))
+        now = time.time()
+        keep = []
+        for n, t in self.bursts:
+            if t < now:
+                n.removeFromParentNode()
+            else:
+                keep.append((n, t))
+        self.bursts = keep
+        SCNTransaction.commit()
+
+    def sync_fighter(self, f, hide_head):
+        d = self.fdata[f]
+        cache = d['cache']
+        pt = f.pt
+        alive = []
+        for seg in f.segs:
+            if seg.dead:
+                if seg.node is not None:
+                    seg.node.removeFromParentNode()
+                    seg.node = None
+                continue
+            alive.append(seg)
+            if seg.prof is None:
+                continue
+            fr = f.seg_frame(seg)
+            if fr is None:
+                continue
+            if seg.node is None:
+                seg.node = self.seg_node(f, seg)
+                seg.mrk_n = 0
+            if seg.node is None:
+                continue
+            a, b = pt[seg.i], pt[seg.j]
+            mid = ((a.x + b.x) * 0.5, (a.y + b.y) * 0.5, (a.z + b.z) * 0.5)
+            q = quat_from_basis(*fr)
+            if self.moved(cache, seg.key, mid, q):
+                set_pos(seg.node, mid)
+                set_rot(seg.node, q)
+            while seg.mrk_n < len(seg.marks):
+                pos, nrm, size, var = seg.marks[seg.mrk_n]
+                self.decal(seg.node, pos, nrm, size, var)
+                seg.mrk_n += 1
+        f.segs = alive
+
+        for h, hd in d['hands'].items():
+            fr = f.hand_frame(h)
+            p = pt[h].pos()
+            q = quat_from_basis(*fr)
+            if self.moved(cache, ('h', h), p, q):
+                set_pos(hd['node'], p)
+                set_rot(hd['node'], q)
+
+        hdd = d['head']
+        if hdd['hidden'] != hide_head:
+            hdd['node'].setHidden_(hide_head)
+            hdd['hidden'] = hide_head
+        fr = f.head_frame()
+        hp = pt[HEAD].pos()
+        q = quat_from_basis(*fr)
+        if self.moved(cache, 'head', hp, q):
+            set_pos(hdd['node'], hp)
+            set_rot(hdd['node'], q)
+        while hdd['mrk'] < len(f.head_marks):
+            pos, nrm, size, var = f.head_marks[hdd['mrk']]
+            self.decal(hdd['node'], pos, nrm, size, var)
+            hdd['mrk'] += 1
+
+        g, t = pt[GRIP], pt[TIP]
+        Y = norm(sub(t.pos(), g.pos()))
+        X = norm(sub(f.edge, mul(Y, dot(f.edge, Y))))
+        if X == (0.0, 0.0, 0.0):
+            X = basis_y(Y)[0]
+        q = quat_from_basis(X, Y, cross(X, Y))
+        sd = d['sword']
+        if self.moved(cache, 'sword', g.pos(), q):
+            set_pos(sd['node'], g.pos())
+            set_rot(sd['node'], q)
+        while sd['mrk'] < len(f.sword_marks):
+            y, var = f.sword_marks[sd['mrk']]
+            x = -0.018 * (y / BLADE) ** 2
+            for side in (-1.0, 1.0):
+                self.decal(sd['node'], (x, y, side * 0.0042), (0.0, 0.0, side),
+                           0.024, var, stretch=2.2)
+            sd['mrk'] += 1
+
+
+# =====================================================================
+# HUD
+# =====================================================================
+FONT = '<system-bold>'
+
+LIMB_FIG = [
+    ('uarm_l', (-7, -16), (-13, -6)), ('farm_l', (-13, -6), (-15, 5)),
+    ('uarm_r', (7, -16), (13, -6)), ('farm_r', (13, -6), (15, 5)),
+    ('thigh_l', (-4, 4), (-6, 15)), ('shin_l', (-6, 15), (-7, 26)),
+    ('thigh_r', (4, 4), (6, 15)), ('shin_r', (6, 15), (7, 26)),
+]
+
+
+def wound_color(f, key):
+    if key in f.lost:
+        return (0.95, 0.18, 0.16, 0.95)
+    n = f.wounds.get(key, 0)
+    return [(1, 1, 1, 0.8), (1.0, 0.78, 0.62, 0.9),
+            (1.0, 0.48, 0.30, 0.95)][min(n, 2)]
+
+
+def draw_text(s, rect, size, col, align=None):
+    al = ui.ALIGN_LEFT if align is None else align
+    ui.draw_string(s, rect=(rect[0] + 1, rect[1] + 1.5, rect[2], rect[3]),
+                   font=(FONT, size), color=(0, 0, 0, 0.55), alignment=al)
+    ui.draw_string(s, rect=rect, font=(FONT, size), color=col, alignment=al)
+
+
+class HUD(ui.View):
+    def draw(self):
+        g = getattr(self, 'game', None)
+        if g is None or g.mode == 'menu':
+            return
+        wd = g.world
+        W, H = self.width, self.height
+        bw = W * 0.28
+        self.bar(24, 22, bw, wd.player, False)
+        self.bar(W - 24 - bw, 22, bw, wd.cpu, True)
+        self.figure(24 + bw + 26, 48, wd.player)
+        self.figure(W - 24 - bw - 26, 48, wd.cpu)
+        draw_text(wd.st['name'], (0, 10, W, 20), 14, (1, 0.95, 0.85, 0.9), ui.ALIGN_CENTER)
+        marks = '●' * wd.wins[0] + '○' * (WIN_ROUNDS - wd.wins[0])
+        marks2 = '●' * wd.wins[1] + '○' * (WIN_ROUNDS - wd.wins[1])
+        draw_text('%s   %s' % (marks, marks2), (0, 30, W, 22), 16,
+                  (1, 0.97, 0.9), ui.ALIGN_CENTER)
+        if not wd.player.armed and wd.player.alive():
+            draw_text('刀を失った', (24, 60, bw, 20), 13, (1, 0.6, 0.55))
+        y = H * 0.24
+        for text, ttl, col in wd.events:
+            a = clamp(ttl / 0.4, 0.0, 1.0)
+            draw_text(text, (0, y, W, 34), 24, (col[0], col[1], col[2], a), ui.ALIGN_CENTER)
+            y += 34
+        if g.mode == 'play' and wd.state == 'over' and wd.match is None and wd.over_t > 1.0:
+            draw_text('画面をタップで次の勝負', (0, H * 0.24 + 70, W, 24), 15,
+                      (1, 0.95, 0.88, 0.85), ui.ALIGN_CENTER)
+        # 操作面の境目(右側が剣)
+        x0 = W * PAD_X0
+        ui.set_color((1, 1, 1, 0.07))
+        ui.Path.rect(x0, H * 0.18, 1.5, H * 0.7).fill()
+        if g.joy:
+            ox, oy, cx, cy = g.joy
+            ui.set_color((1, 1, 1, 0.14))
+            ui.Path.oval(ox - 56, oy - 56, 112, 112).fill()
+            dx, dy = cx - ox, cy - oy
+            l = math.hypot(dx, dy)
+            if l > 56:
+                dx, dy = dx * 56 / l, dy * 56 / l
+            ui.set_color((1, 1, 1, 0.45))
+            ui.Path.oval(ox + dx - 24, oy + dy - 24, 48, 48).fill()
+        tr = g.trail
+        if len(tr) > 1:
+            now = time.perf_counter()
+            for i in range(1, len(tr)):
+                a = clamp(1.0 - (now - tr[i][2]) / 0.35, 0.0, 1.0)
+                if a <= 0:
+                    continue
+                p = ui.Path()
+                p.move_to(tr[i - 1][0], tr[i - 1][1])
+                p.line_to(tr[i][0], tr[i][1])
+                p.line_width = 2 + 8 * a
+                p.line_cap_style = 1
+                ui.set_color((1.0, 0.97, 0.9, 0.5 * a))
+                p.stroke()
+        if g.drag and g.drag[5] > 6:
+            vx, vy = g.pad_map(g.drag[3], g.drag[4])
+            ui.set_color((1.0, 0.95, 0.85, 0.75))
+            p = ui.Path.oval(vx - 9, vy - 9, 18, 18)
+            p.line_width = 2
+            p.stroke()
+        if wd.t < 7.0 and wd.round_no == 1:
+            a = clamp((7.0 - wd.t) / 1.0, 0.0, 1.0)
+            draw_text('左:移動 右側だけで剣を全方向に振れる 右タップ:突き',
+                      (0, H - 34, W, 22), 14, (1, 1, 1, 0.8 * a), ui.ALIGN_CENTER)
+        if MESH_ERR and not g.rend.mesh_ok:
+            draw_text('人体メッシュ生成失敗: ' + MESH_ERR[-1][:90], (12, H - 20, W, 16), 10,
+                      (1, 0.6, 0.5, 0.9))
+
+    def bar(self, x, y, w, f, flip):
+        ui.set_color((0.06, 0.04, 0.05, 0.7))
+        ui.Path.rounded_rect(x - 3, y - 3, w + 6, 20, 4).fill()
+        ui.set_color((1, 1, 1, 0.1))
+        ui.Path.rect(x, y, w, 14).fill()
+        gw = w * clamp(f.hp_ghost / MAX_HP, 0, 1)
+        ui.set_color((0.98, 0.82, 0.45, 0.6))
+        ui.Path.rect(x + (w - gw if flip else 0), y, gw, 14).fill()
+        bw = w * clamp(f.hp / MAX_HP, 0, 1)
+        ui.set_color(f.pal['hud'])
+        ui.Path.rect(x + (w - bw if flip else 0), y, bw, 14).fill()
+        ui.set_color((1, 1, 1, 0.22))
+        ui.Path.rect(x + (w - bw if flip else 0), y, bw, 5).fill()
+
+    def figure(self, cx, cy, f):
+        ok = (1, 1, 1, 0.8)
+        ui.set_color(wound_color(f, 'neck'))
+        if 'neck' in f.lost:
+            ui.Path.oval(cx + 6, cy - 40, 10, 10).fill()
+        else:
+            ui.Path.oval(cx - 5, cy - 32, 10, 10).fill()
+        p = ui.Path()
+        p.move_to(cx, cy - 22)
+        p.line_to(cx, cy - 18)
+        p.line_width = 3
+        p.stroke()
+        ui.set_color(ok)
+        p = ui.Path()
+        p.move_to(cx, cy - 18)
+        p.line_to(cx, cy + 4)
+        p.line_width = 4
+        p.stroke()
+        p = ui.Path()
+        p.move_to(cx - 8, cy - 17)
+        p.line_to(cx + 8, cy - 17)
+        p.line_width = 3
+        p.stroke()
+        for key, a, b in LIMB_FIG:
+            p = ui.Path()
+            p.move_to(cx + a[0], cy + a[1])
+            p.line_to(cx + b[0], cy + b[1])
+            p.line_width = 3
+            ui.set_color(wound_color(f, key))
+            p.stroke()
+
+
+# =====================================================================
+# ステージ選択画面
+# =====================================================================
+def draw_stage_art(st, x, y, w, h):
+    top, mid, hor, low = st['sky']
+    N = 24
+    for i in range(N):
+        v = i / float(N - 1)
+        c = lerp(top, mid, v / 0.6) if v < 0.6 else lerp(mid, hor, (v - 0.6) / 0.4)
+        ui.set_color(c)
+        ui.Path.rect(x, y + h * 0.7 * i / N, w, h * 0.7 / N + 1).fill()
+    ui.set_color(st['mtn'])
+    p = ui.Path()
+    p.move_to(x, y + h * 0.7)
+    p.line_to(x + w * 0.35, y + h * 0.45)
+    p.line_to(x + w * 0.6, y + h * 0.62)
+    p.line_to(x + w * 0.8, y + h * 0.5)
+    p.line_to(x + w, y + h * 0.66)
+    p.line_to(x + w, y + h * 0.7)
+    p.close()
+    p.fill()
+    if st['disc']:
+        ui.set_color((1.0, 0.92, 0.8, 0.95) if st['disc'] == 'sun' else (0.92, 0.95, 1.0, 0.95))
+        ui.Path.oval(x + w * 0.66, y + h * 0.16, w * 0.16, w * 0.16).fill()
+    ui.set_color(lerp(low, (0, 0, 0), 0.3))
+    ui.Path.rect(x, y + h * 0.7, w, h * 0.3).fill()
+    motif = st['scenery']
+    if motif == 'temple':
+        ui.set_color((0.70, 0.12, 0.08))
+        ui.Path.rect(x + w * 0.2, y + h * 0.42, w * 0.03, h * 0.3).fill()
+        ui.Path.rect(x + w * 0.42, y + h * 0.42, w * 0.03, h * 0.3).fill()
+        ui.Path.rect(x + w * 0.15, y + h * 0.4, w * 0.35, h * 0.03).fill()
+    elif motif == 'bamboo':
+        ui.set_color((0.25, 0.42, 0.22))
+        for k in range(9):
+            ui.Path.rect(x + w * (0.05 + k * 0.11), y, w * 0.022, h * 0.72).fill()
+    elif motif == 'castle':
+        ui.set_color((0.92, 0.92, 0.9))
+        ui.Path.rect(x + w * 0.2, y + h * 0.45, w * 0.25, h * 0.25).fill()
+        ui.set_color((0.25, 0.27, 0.3))
+        ui.Path.rect(x + w * 0.16, y + h * 0.43, w * 0.33, h * 0.04).fill()
+    else:
+        ui.set_color((0.08, 0.05, 0.05))
+        ui.Path.rect(x + w * 0.55, y + h * 0.35, w * 0.3, h * 0.36).fill()
+        ui.set_color((1.0, 0.45, 0.1, 0.9))
+        for k in range(4):
+            ui.Path.oval(x + w * (0.56 + k * 0.07), y + h * 0.28, w * 0.07, h * 0.12).fill()
+
+
+class Menu(ui.View):
+    def __init__(self, game, frame):
+        ui.View.__init__(self, frame=frame)
+        self.game = game
+        self.flex = 'WH'
+        self.background_color = (0, 0, 0, 0)
+        self.btns = []
+        for k in range(len(STAGES)):
+            b = ui.Button(title='')
+            b.background_color = (0, 0, 0, 0)
+            b.action = (lambda kk: (lambda s: game.start_stage(kk)))(k)
+            self.add_subview(b)
+            self.btns.append(b)
+        self.layout()
+
+    def cards(self):
+        W, H = self.width, self.height
+        n = len(STAGES)
+        gap = 14
+        cw = (W - 48 - gap * (n - 1)) / float(n)
+        ch = min(H * 0.58, cw * 1.35)
+        y0 = H * 0.25
+        return [(24 + k * (cw + gap), y0, cw, ch) for k in range(n)]
+
+    def layout(self):
+        for b, r in zip(self.btns, self.cards()):
+            b.frame = r
+
+    def draw(self):
+        g = self.game
+        W, H = self.width, self.height
+        ui.set_color((0.03, 0.02, 0.03, 0.78))
+        ui.Path.rect(0, 0, W, H).fill()
+        draw_text('斬 鉄  3D', (0, H * 0.04, W, 40), 32, (1, 0.95, 0.85), ui.ALIGN_CENTER)
+        draw_text('― 演舞場を選べ ―', (0, H * 0.04 + 42, W, 22), 15,
+                  (0.9, 0.85, 0.78), ui.ALIGN_CENTER)
+        for k, (x, y, cw, ch) in enumerate(self.cards()):
+            st = STAGES[k]
+            ok = g.unlocked(k)
+            with ui.GState():
+                clip = ui.Path.rounded_rect(x, y, cw, ch * 0.62, 10)
+                clip.add_clip()
+                draw_stage_art(st, x, y, cw, ch * 0.62)
+                if not ok:
+                    ui.set_color((0, 0, 0, 0.6))
+                    ui.Path.rect(x, y, cw, ch).fill()
+            ui.set_color((0.10, 0.07, 0.08, 0.85))
+            ui.Path.rounded_rect(x, y + ch * 0.62, cw, ch * 0.38, 10).fill()
+            border = ui.Path.rounded_rect(x, y, cw, ch, 10)
+            border.line_width = 2
+            ui.set_color((0.95, 0.78, 0.35, 0.95) if g.cleared[k]
+                         else ((1, 1, 1, 0.35) if ok else (1, 1, 1, 0.12)))
+            border.stroke()
+            ty = y + ch * 0.64
+            dim = 1.0 if ok else 0.45
+            draw_text('第%s景' % '一二三四五六'[k], (x, ty, cw, 18), 12,
+                      (0.9, 0.8, 0.6, dim), ui.ALIGN_CENTER)
+            draw_text(st['name'], (x, ty + 18, cw, 24), 17, (1, 0.96, 0.9, dim),
+                      ui.ALIGN_CENTER)
+            draw_text(st['desc'], (x, ty + 42, cw, 18), 11, (0.85, 0.82, 0.78, dim),
+                      ui.ALIGN_CENTER)
+            stars = int(round(st['level'] * 2.8 - 1.1))
+            draw_text('★' * stars + '☆' * (4 - stars), (x, ty + 60, cw, 18), 12,
+                      (1, 0.8, 0.35, dim), ui.ALIGN_CENTER)
+            if g.cleared[k]:
+                draw_text('制覇', (x + cw - 50, y + 8, 42, 20), 14, (1, 0.85, 0.4),
+                          ui.ALIGN_CENTER)
+            elif not ok:
+                draw_text('封印', (x, y + ch * 0.25, cw, 24), 18, (1, 1, 1, 0.8),
+                          ui.ALIGN_CENTER)
+                draw_text('前の景を制覇せよ', (x, y + ch * 0.25 + 24, cw, 18), 11,
+                          (1, 1, 1, 0.6), ui.ALIGN_CENTER)
+        draw_text('%d 本先取で景を制覇 左:移動 右:剣' % WIN_ROUNDS,
+                  (0, H - 30, W, 20), 12, (0.85, 0.82, 0.78, 0.8), ui.ALIGN_CENTER)
+
+
+# =====================================================================
+# クリア / 敗北画面
+# =====================================================================
+class Result(ui.View):
+    def __init__(self, game, frame, win, world):
+        ui.View.__init__(self, frame=frame)
+        self.game = game
+        self.win = win
+        self.flex = 'WH'
+        self.background_color = (0, 0, 0, 0)
+        self.stage = world.stage
+        self.st = world.st
+        s = world.stats
+        self.lines = [
+            ('試合時間', '%d:%02d' % (int(s['time']) // 60, int(s['time']) % 60)),
+            ('断った部位', '%d' % s['sever']),
+            ('与えた傷', '%d' % s['wound']),
+            ('深手', '%d' % s['deep']),
+            ('勝ち越し', '%d - %d' % (world.wins[0], world.wins[1])),
+        ]
+        if win:
+            hp = sum(s['hp']) / max(1, len(s['hp']))
+            score = 45 + s['sever'] * 7 + s['deep'] * 3 + hp * 0.45 - s['time'] / 8.0 \
+                - world.wins[1] * 12
+            self.grade = '優' if score >= 85 else ('良' if score >= 65 else '可')
+            self.lines.append(('残り体力', '%d' % hp))
+        else:
+            self.grade = None
+        opts = []
+        if win and self.stage + 1 < len(STAGES):
+            opts.append(('次の景へ', lambda s: game.start_stage(self.stage + 1)))
+        opts.append(('もう一度' if win else '再挑戦', lambda s: game.start_stage(self.stage)))
+        opts.append(('景を選ぶ', lambda s: game.show_menu()))
+        self.btns = []
+        for title, act in opts:
+            b = ui.Button(title=title)
+            b.font = (FONT, 16)
+            b.tint_color = (1, 0.96, 0.88)
+            b.background_color = (0.55, 0.12, 0.10, 0.9) if not self.btns \
+                else (0.15, 0.10, 0.10, 0.85)
+            b.corner_radius = 22
+            b.action = act
+            self.add_subview(b)
+            self.btns.append(b)
+        self.layout()
+
+    def layout(self):
+        W, H = self.width, self.height
+        n = len(self.btns)
+        bw, gap = 150, 16
+        x0 = (W - (bw * n + gap * (n - 1))) * 0.5
+        for k, b in enumerate(self.btns):
+            b.frame = (x0 + k * (bw + gap), H * 0.80, bw, 44)
+
+    def draw(self):
+        W, H = self.width, self.height
+        ui.set_color((0.02, 0.01, 0.02, 0.72))
+        ui.Path.rect(0, 0, W, H).fill()
+        last = self.win and self.stage + 1 >= len(STAGES)
+        if self.win:
+            title = '天晴れ' if not last else '天下無双'
+            sub_ = '%s 制覇' % self.st['name'] if not last else '全ての景を制覇した'
+            col = (1.0, 0.85, 0.45)
+        else:
+            title, sub_, col = '敗北', '%s にて散る' % self.st['name'], (0.9, 0.45, 0.4)
+        draw_text(title, (0, H * 0.08, W, 60), 48, col, ui.ALIGN_CENTER)
+        draw_text(sub_, (0, H * 0.08 + 62, W, 26), 18, (1, 0.95, 0.88), ui.ALIGN_CENTER)
+        x0, y = W * 0.5 - 150, H * 0.36
+        for k, v in self.lines:
+            draw_text(k, (x0, y, 160, 24), 16, (0.85, 0.82, 0.78))
+            draw_text(v, (x0 + 160, y, 140, 24), 16, (1, 0.97, 0.9), ui.ALIGN_RIGHT)
+            y += 26
+        if self.grade:
+            draw_text('評価', (W * 0.5 + 170, H * 0.36, 80, 22), 14, (0.9, 0.85, 0.75),
+                      ui.ALIGN_CENTER)
+            draw_text(self.grade, (W * 0.5 + 170, H * 0.36 + 22, 80, 70), 56,
+                      (1.0, 0.8, 0.35), ui.ALIGN_CENTER)
+
+
+# =====================================================================
+# 本体
+# =====================================================================
+class GameView(ui.View):
+    def __init__(self, *a, **kw):
+        ui.View.__init__(self, *a, **kw)
+        w, h = ui.get_screen_size()
+        if w < h:
+            w, h = h, w
+        self.frame = (0, 0, w, h)
+        self.background_color = 'black'
+        self.multitouch_enabled = True      # 移動と剣を同時に操作する
+        self.mode = 'menu'
+        self.stage = 0
+        self.cleared = [False] * len(STAGES)
+        self.world = World(0)
+        self.cam = Camera()
+        self.rend = Renderer(w, h, STAGES[0])
+        ObjCInstance(self).addSubview_(self.rend.view)
+        self.hud = HUD(frame=(0, 0, w, h))
+        self.hud.flex = 'WH'
+        self.hud.background_color = (0, 0, 0, 0)
+        self.hud.touch_enabled = False
+        self.hud.game = self
+        self.add_subview(self.hud)
+
+        def btn(title, frame, action, size=16):
+            b = ui.Button(title=title)
+            b.frame = frame
+            b.font = (FONT, size)
+            b.tint_color = (1, 0.97, 0.9)
+            b.background_color = (0.12, 0.06, 0.07, 0.55)
+            b.corner_radius = frame[3] * 0.5
+            b.action = action
+            self.add_subview(b)
+            return b
+
+        self.jump_btn = btn('跳', (18, h * 0.40, 64, 64),
+                            lambda s: self.world.player.do_jump(), 24)
+        self.view_btn = btn('三人称', (0, 0, 76, 40), lambda s: self.toggle_view(), 13)
+        self.menu_btn = btn('景', (0, 0, 44, 40), lambda s: self.show_menu(), 15)
+        self.reset_btn = btn('仕切直し', (0, 0, 88, 40), lambda s: self.redo(), 13)
+        self.quit_btn = btn('×', (0, 0, 40, 40), lambda s: self.close(), 20)
+        self.game_btns = [self.jump_btn, self.view_btn, self.menu_btn, self.reset_btn]
+
+        self.menu = Menu(self, (0, 0, w, h))
+        self.add_subview(self.menu)
+        self.result = None
+
+        self.touches = {}
+        self.joy = None
+        self.drag = None
+        self.trail = []
+        self.last = time.perf_counter()
+        self.acc = 0.0
+        self.layout()
+        self.set_mode_ui()
+        self.update_interval = 1.0 / 60.0
+
+    def layout(self):
+        w, h = self.width, self.height
+        self.rend.view.setFrame_(CGRect(CGPoint(0, 0), CGSize(w, h)))
+        self.jump_btn.frame = (18, h * 0.40, 64, 64)
+        x = w - 16
+        for b in (self.quit_btn, self.reset_btn, self.menu_btn, self.view_btn):
+            fw, fh = b.frame[2], b.frame[3]
+            x -= fw
+            b.frame = (x, 62, fw, fh)
+            x -= 8
+
+    # ---------- 画面の切り替え ----------
+    def unlocked(self, k):
+        return k == 0 or self.cleared[k - 1]
+
+    def set_mode_ui(self):
+        play = self.mode == 'play'
+        for b in self.game_btns:
+            b.hidden = not play
+        self.menu.hidden = self.mode != 'menu'
+        if self.mode == 'menu':
+            self.menu.set_needs_display()
+
+    def clear_input(self):
+        self.touches.clear()
+        self.joy = None
+        self.drag = None
+        self.trail = []
+
+    def start_stage(self, k):
+        if not self.unlocked(k):
+            return
+        if self.result is not None:
+            self.remove_subview(self.result)
+            self.result = None
+        if self.rend.stage_key != STAGES[k]['key']:
+            self.rend.build_stage(STAGES[k])
+        self.stage = k
+        self.world = World(k)
+        self.mode = 'play'
+        self.clear_input()
+        self.set_mode_ui()
+
+    def show_menu(self):
+        if self.result is not None:
+            self.remove_subview(self.result)
+            self.result = None
+        self.mode = 'menu'
+        self.clear_input()
+        self.set_mode_ui()
+
+    def show_result(self):
+        win = self.world.match == 'win'
+        if win:
+            self.cleared[self.stage] = True
+        self.mode = 'result'
+        self.clear_input()
+        self.result = Result(self, (0, 0, self.width, self.height), win, self.world)
+        self.add_subview(self.result)
+        self.set_mode_ui()
+
+    def redo(self):
+        if self.mode == 'play':
+            self.world.redo_round()
+            self.clear_input()
+
+    def toggle_view(self):
+        if self.cam.mode == 'tps':
+            self.cam.set_mode('fps')
+            self.view_btn.title = '一人称'
+        else:
+            self.cam.set_mode('tps')
+            self.view_btn.title = '三人称'
+
+    # ---------- 入力 ----------
+    def pad_map(self, x, y):
+        """右側の操作面 → 画面全体。右半分だけで剣を全方向に振れる"""
+        W, H = self.width, self.height
+        x0 = W * PAD_X0 + 10
+        u = clamp((x - x0) / max(1.0, W - 14 - x0), 0.0, 1.0)
+        v = clamp((y - 40) / max(1.0, H - 60), 0.0, 1.0)
+        return W * (0.03 + 0.94 * u), H * (0.05 + 0.90 * v)
+
+    def touch_began(self, t):
+        if self.mode != 'play':
+            return
+        x, y = t.location
+        wd = self.world
+        if wd.state == 'over' and wd.match is None and wd.over_t > 1.0:
+            wd.next_round()
+            self.clear_input()
+            return
+        if x < self.width * PAD_X0 and self.joy is None:
+            self.touches[t.touch_id] = 'joy'
+            self.joy = [x, y, x, y]
+        elif x >= self.width * PAD_X0 and self.drag is None:
+            self.touches[t.touch_id] = 'sword'
+            now = time.perf_counter()
+            self.drag = [x, y, now, x, y, 0.0]
+            vx, vy = self.pad_map(x, y)
+            self.trail = [(vx, vy, now)]
+
+    def touch_moved(self, t):
+        role = self.touches.get(t.touch_id)
+        x, y = t.location
+        if role == 'joy' and self.joy:
+            self.joy[2], self.joy[3] = x, y
+        elif role == 'sword' and self.drag:
+            d = self.drag
+            d[5] += math.hypot(x - d[3], y - d[4])
+            d[3], d[4] = x, y
+            vx, vy = self.pad_map(x, y)
+            self.trail.append((vx, vy, time.perf_counter()))
+            if len(self.trail) > 16:
+                self.trail.pop(0)
+
+    def touch_ended(self, t):
+        role = self.touches.pop(t.touch_id, None)
+        if role == 'joy':
+            self.joy = None
+        elif role == 'sword' and self.drag:
+            d = self.drag
+            if time.perf_counter() - d[2] < 0.2 and d[5] < 14:
+                self.world.player.do_thrust()
+            self.drag = None
+
+    def touch_cancelled(self, t):
+        self.touch_ended(t)
+
+    def apply_input(self):
+        P = self.world.player
+        cam = self.cam
+        if self.mode != 'play':
+            P.mvx = P.mvz = 0.0
+            P.T_goal = None
+            return
+        if self.joy:
+            ox, oy, cx, cy = self.joy
+            jx = clamp((cx - ox) / 56.0, -1.0, 1.0)
+            jy = clamp(-(cy - oy) / 56.0, -1.0, 1.0)
+            fw = norm((cam.fw[0], 0.0, cam.fw[2]))
+            rt = norm((cam.right[0], 0.0, cam.right[2]))
+            mx = rt[0] * jx + fw[0] * jy
+            mz = rt[2] * jx + fw[2] * jy
+            l = math.hypot(mx, mz)
+            if l > 1.0:
+                mx, mz = mx / l, mz / l
+            if l < 0.15:
+                mx = mz = 0.0
+            P.mvx, P.mvz = mx, mz
+        else:
+            P.mvx = P.mvz = 0.0
+        if self.drag and self.drag[5] > 6:
+            vx, vy = self.pad_map(self.drag[3], self.drag[4])
+            P.T_goal = cam.drag_target(P, vx, vy, self.width, self.height)
+        else:
+            P.T_goal = None
+
+    # ---------- ループ ----------
+    def update(self):
+        now = time.perf_counter()
+        el = min(now - self.last, 0.05)
+        self.last = now
+        wd = self.world
+        if self.mode in ('play', 'result'):
+            scale = 0.3 if wd.slowmo > 0 else 1.0
+            if wd.slowmo > 0:
+                wd.slowmo -= el
+            self.acc += el * scale
+            self.apply_input()
+            n = 0
+            while self.acc >= DT and n < 3:
+                wd.step()
+                self.acc -= DT
+                n += 1
+            if self.acc > DT * 3:
+                self.acc = 0.0
+            if self.mode == 'play' and wd.match and wd.over_t > 2.2:
+                self.show_result()
+        self.cam.update(wd, el)
+        self.rend.sync(wd, self.cam)
+        self.hud.set_needs_display()
+
+    def will_close(self):
+        self.update_interval = 0
+        self.rend.view.setPlaying_(False)
+
+
+def main():
+    v = GameView()
+    v.present('fullscreen', hide_title_bar=True, orientations=['landscape'])
+
+
+if __name__ == '__main__':
+    main()
